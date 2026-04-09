@@ -7,10 +7,10 @@ import random
 import threading
 import time
 import uuid
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from logging import Logger
-from pathlib import Path
 
 from ..config import AppConfig
 
@@ -36,11 +36,18 @@ class AccessToken:
     expires_at: float
 
 
+@dataclass(slots=True)
+class AccountState:
+    refresh_token: str
+    cached_token: AccessToken | None = None
+
+
 class GLMAccessTokenManager:
     def __init__(self, config: AppConfig, logger: Logger) -> None:
         self.config = config
         self.logger = logger
-        self._cached: AccessToken | None = None
+        self._accounts = [AccountState(refresh_token=token) for token in config.glm_refresh_tokens]
+        self._current_index = 0
         self._lock = threading.Lock()
         self._persist_lock = threading.Lock()
 
@@ -81,12 +88,50 @@ class GLMAccessTokenManager:
 
     def get_access_token(self) -> str:
         with self._lock:
-            if self._cached and time.time() < self._cached.expires_at - 60:
-                return self._cached.access_token
-            self._cached = self._refresh_access_token()
-            return self._cached.access_token
+            return self._get_access_token_for_index(self._current_index)
 
-    def _refresh_access_token(self) -> AccessToken:
+    def get_account_count(self) -> int:
+        return len(self._accounts)
+
+    def get_current_account_index(self) -> int:
+        with self._lock:
+            return self._current_index
+
+    def advance_account(self, failed_index: int, reason: str) -> int:
+        with self._lock:
+            if failed_index != self._current_index:
+                return self._current_index
+            next_index = (failed_index + 1) % len(self._accounts)
+            self._current_index = next_index
+            self.logger.warning(
+                "账号请求失败，切换 refresh_token 账号 index=%s -> %s reason=%s",
+                failed_index,
+                next_index,
+                reason,
+            )
+            return next_index
+
+    def reset_account_cycle(self) -> None:
+        with self._lock:
+            self._current_index = 0
+
+    def invalidate_account(self, account_index: int) -> None:
+        with self._lock:
+            self._accounts[account_index].cached_token = None
+
+    def get_access_token_for_account(self, account_index: int) -> str:
+        with self._lock:
+            return self._get_access_token_for_index(account_index)
+
+    def _get_access_token_for_index(self, account_index: int) -> str:
+        account = self._accounts[account_index]
+        if account.cached_token and time.time() < account.cached_token.expires_at - 60:
+            return account.cached_token.access_token
+        account.cached_token = self._refresh_access_token(account_index)
+        return account.cached_token.access_token
+
+    def _refresh_access_token(self, account_index: int) -> AccessToken:
+        account = self._accounts[account_index]
         timestamp, nonce, sign = build_sign()
         request = urllib.request.Request(
             self.config.refresh_url,
@@ -94,7 +139,7 @@ class GLMAccessTokenManager:
             method="POST",
             headers={
                 **self.get_browser_headers(),
-                "Authorization": f"Bearer {self.config.glm_refresh_token}",
+                "Authorization": f"Bearer {account.refresh_token}",
                 "X-Device-Id": uuid.uuid4().hex,
                 "X-Nonce": nonce,
                 "X-Request-Id": uuid.uuid4().hex,
@@ -107,40 +152,65 @@ class GLMAccessTokenManager:
         code = payload.get("code", payload.get("status"))
         result = payload.get("result") or {}
         access_token = result.get("access_token")
-        refresh_token = result.get("refresh_token", self.config.glm_refresh_token)
+        refresh_token = result.get("refresh_token", account.refresh_token)
         if response.status != 200 or code not in {0, None} or not access_token:
             raise RuntimeError(f"刷新 GLM token 失败: {payload}")
-        if refresh_token != self.config.glm_refresh_token:
-            self._persist_refresh_token(refresh_token)
-            self.config.glm_refresh_token = refresh_token
-            self.logger.info("GLM refresh_token 已自动刷新并写回 .env")
+        if refresh_token != account.refresh_token:
+            self._persist_refresh_token(account_index, refresh_token)
+            account.refresh_token = refresh_token
+            self.config.glm_refresh_tokens[account_index] = refresh_token
+            if account_index == 0:
+                self.config.glm_refresh_token = refresh_token
+            self.logger.info("GLM refresh_token 已自动刷新并写回账号存储 index=%s", account_index)
         return AccessToken(
             access_token=access_token,
             refresh_token=refresh_token,
             expires_at=time.time() + ACCESS_TOKEN_EXPIRES_SECONDS - random.randint(10, 30),
         )
 
-    def _persist_refresh_token(self, refresh_token: str) -> None:
+    def _persist_refresh_token(self, account_index: int, refresh_token: str) -> None:
+        with self._persist_lock:
+            if self.config.token_file_path.exists() or len(self.config.glm_refresh_tokens) > 1:
+                tokens = list(self.config.glm_refresh_tokens)
+                tokens[account_index] = refresh_token
+                content = "\n".join(tokens) + "\n"
+                self.config.token_file_path.write_text(content, encoding="utf-8")
+                return
+            self._persist_env_refresh_token(refresh_token)
+
+    def _persist_env_refresh_token(self, refresh_token: str) -> None:
         env_path = self.config.env_file_path
         if not env_path.exists():
             self.logger.warning(".env 文件不存在，无法自动写回新的 refresh_token")
             return
 
-        with self._persist_lock:
-            content = env_path.read_text(encoding="utf-8")
-            lines = content.splitlines()
-            updated = False
+        content = env_path.read_text(encoding="utf-8")
+        lines = content.splitlines()
+        updated = False
 
-            for index, line in enumerate(lines):
-                if line.startswith("GLM_REFRESH_TOKEN="):
-                    lines[index] = f"GLM_REFRESH_TOKEN={refresh_token}"
-                    updated = True
-                    break
+        for index, line in enumerate(lines):
+            if line.startswith("GLM_REFRESH_TOKEN="):
+                lines[index] = f"GLM_REFRESH_TOKEN={refresh_token}"
+                updated = True
+                break
 
-            if not updated:
-                if lines and lines[-1].strip():
-                    lines.append("")
-                lines.append(f"GLM_REFRESH_TOKEN={refresh_token}")
+        if not updated:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append(f"GLM_REFRESH_TOKEN={refresh_token}")
 
-            new_content = "\n".join(lines) + "\n"
-            env_path.write_text(new_content, encoding="utf-8")
+        new_content = "\n".join(lines) + "\n"
+        env_path.write_text(new_content, encoding="utf-8")
+
+    def should_switch_account(self, exc: Exception) -> bool:
+        if hasattr(exc, "status_code"):
+            return True
+        if isinstance(exc, urllib.error.HTTPError):
+            return True
+        if isinstance(exc, urllib.error.URLError):
+            return True
+        if isinstance(exc, TimeoutError):
+            return True
+        if isinstance(exc, RuntimeError):
+            return "token" in str(exc).lower()
+        return False

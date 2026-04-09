@@ -43,7 +43,15 @@ GLM_REFRESH_TOKEN=你的_refresh_token
 cp .env.example .env
 ```
 
-最少只需要改这一项：
+推荐优先准备 `token.txt`，每行一个账号的 `refresh_token`：
+
+```text
+token-a
+token-b
+token-c
+```
+
+如果你暂时只有一个账号，也可以继续只改 `.env` 里的这一项：
 
 ```env
 GLM_REFRESH_TOKEN=你的_refresh_token
@@ -63,28 +71,30 @@ GLM_REFRESH_TOKEN=你的_refresh_token
 - `GLM_ASSISTANT_ID`
   普通对话使用的 assistant id
 
+- `GLM_TOKEN_FILE`
+  多账号 token 文件路径，默认 `token.txt`，每行一个 `refresh_token`
+
 - `GLM_IMAGE_ASSISTANT_ID`
   图片生成使用的 assistant id
-
-- `GLM_IMAGE_MODEL_NAME`
-  对外暴露给 OpenAI 客户端使用的绘图模型名，默认是 `glm-image-1`
 
 - `GLM_DELETE_CONVERSATION`
   是否在请求结束后自动删除 GLM 会话记录
 
+- `GLM_MAX_CONCURRENCY`
+  本地代理允许同时占用的上游执行槽位数量，默认 `3`
+
 - `SERVER_API_KEYS`
   如果你希望访问本地代理时也带 Bearer Token，可以在这里填写
 
-- `EXPOSED_MODELS`
-  `/v1/models` 对外展示的模型列表
-
-- `GLM_MODEL_ALIASES`
-  模型别名映射，格式为 `对外模型名=上游模型名或assistant_id`
-
 说明：
 
-- 当上游返回新的 `refresh_token` 时，程序会自动写回 `.env`
+- 如果存在 `token.txt`，程序会优先从这里加载多账号
+- 当某个账号请求失败时，会自动切换到下一账号继续尝试
+- 如果本轮所有账号都失败，下一次会从第一个账号重新开始
+- 当上游返回新的 `refresh_token` 时，多账号模式会自动写回 `token.txt` 对应行
+- 单账号兜底模式下，程序仍会自动写回 `.env`
 - 如果你的 `.env` 不存在，程序无法自动落盘新的 token
+- `/v1/models` 返回的模型列表已经固定写在代码中，不再通过配置文件自定义
 
 ## 4. 启动服务
 
@@ -255,6 +265,7 @@ Authorization: Bearer sk-local-1
 
 - 服务启动
 - 请求进入队列
+- 并发槽位获取/释放
 - 上游请求转发
 - 会话删除结果
 - 错误原因

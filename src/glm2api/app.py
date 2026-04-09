@@ -24,10 +24,12 @@ class Application:
 
     def run(self) -> None:
         self.logger.info(
-            "启动服务 host=%s port=%s prefix=%s models=%s",
+            "启动服务 host=%s port=%s prefix=%s concurrency=%s accounts=%s models=%s",
             self.config.host,
             self.config.port,
             self.config.api_prefix,
+            self.config.glm_max_concurrency,
+            len(self.config.glm_refresh_tokens),
             ",".join(self.config.exposed_models),
         )
         try:

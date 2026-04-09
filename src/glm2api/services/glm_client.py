@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import http.client
 import json
 import mimetypes
 import re
@@ -57,41 +58,52 @@ class QueueLease:
         self.release_callback(self.ticket)
 
 
-class SerialRequestQueue:
-    def __init__(self, logger: Logger, wait_timeout: int) -> None:
+class ConcurrentRequestQueue:
+    def __init__(self, logger: Logger, wait_timeout: int, max_concurrency: int) -> None:
         self.logger = logger
         self.wait_timeout = wait_timeout
+        self.max_concurrency = max(1, max_concurrency)
         self._condition = threading.Condition()
         self._next_ticket = 0
         self._serving_ticket = 0
+        self._released_tickets: set[int] = set()
 
     def acquire(self, request_name: str) -> QueueLease:
         with self._condition:
             ticket = self._next_ticket
             self._next_ticket += 1
-            queue_ahead = ticket - self._serving_ticket
+            queue_ahead = max(0, ticket - (self._serving_ticket + self.max_concurrency) + 1)
             start = time.monotonic()
 
             if queue_ahead > 0:
                 self.logger.info("请求进入 GLM 队列 ticket=%s ahead=%s request=%s", ticket, queue_ahead, request_name)
 
-            while ticket != self._serving_ticket:
+            while ticket >= self._serving_ticket + self.max_concurrency:
                 remaining = self.wait_timeout - (time.monotonic() - start)
                 if remaining <= 0:
                     raise QueueTimeoutError(
-                        f"GLM 队列等待超时，前方仍有 {ticket - self._serving_ticket} 个请求，请稍后重试。"
+                        f"GLM 队列等待超时，前方仍有 {ticket - (self._serving_ticket + self.max_concurrency) + 1} 个请求，请稍后重试。"
                     )
                 self._condition.wait(timeout=remaining)
 
-            self.logger.info("请求获得 GLM 执行槽位 ticket=%s request=%s", ticket, request_name)
+            active_slots = ticket - self._serving_ticket + 1
+            self.logger.info(
+                "请求获得 GLM 执行槽位 ticket=%s active=%s/%s request=%s",
+                ticket,
+                active_slots,
+                self.max_concurrency,
+                request_name,
+            )
             return QueueLease(ticket=ticket, release_callback=self._release)
 
     def _release(self, ticket: int) -> None:
         with self._condition:
-            if ticket == self._serving_ticket:
+            self._released_tickets.add(ticket)
+            while self._serving_ticket in self._released_tickets:
+                self._released_tickets.remove(self._serving_ticket)
                 self._serving_ticket += 1
-                self.logger.info("请求离开 GLM 执行槽位 ticket=%s", ticket)
-                self._condition.notify_all()
+            self.logger.info("请求离开 GLM 执行槽位 ticket=%s", ticket)
+            self._condition.notify_all()
 
 
 class GLMWebClient:
@@ -99,7 +111,11 @@ class GLMWebClient:
         self.config = config
         self.logger = logger
         self.auth = GLMAccessTokenManager(config=config, logger=logger)
-        self.request_queue = SerialRequestQueue(logger=logger, wait_timeout=config.glm_queue_wait_timeout)
+        self.request_queue = ConcurrentRequestQueue(
+            logger=logger,
+            wait_timeout=config.glm_queue_wait_timeout,
+            max_concurrency=config.glm_max_concurrency,
+        )
 
     def chat_completion(self, payload: dict[str, object]) -> tuple[dict[str, object], str | None]:
         lease = self.request_queue.acquire(f"chat:{payload.get('model', 'unknown')}")
@@ -118,7 +134,7 @@ class GLMWebClient:
                 if status in {"finish", "intervene"}:
                     return accumulator.build_response(), accumulator.conversation_id
         finally:
-            response.close()
+            response.close() # type: ignore
             self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
             lease.release()
         return accumulator.build_response(), accumulator.conversation_id
@@ -143,7 +159,7 @@ class GLMWebClient:
 
             return self._build_images_response(payload, {}, accumulator)
         finally:
-            response.close()
+            response.close() # type: ignore
             self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
             lease.release()
 
@@ -177,7 +193,7 @@ class GLMWebClient:
                 for chunk in accumulator.finalize(status="stop"):
                     yield chunk.encode("utf-8")
             finally:
-                response.close()
+                response.close() # type: ignore
                 self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
                 lease.release()
 
@@ -190,8 +206,6 @@ class GLMWebClient:
             self.logger.warning("跳过删除 GLM 会话：未获取到 conversation_id assistant_id=%s", assistant_id or self.config.glm_assistant_id)
             return
 
-        timestamp, nonce, sign = build_sign()
-        access_token = self.auth.get_access_token()
         actual_assistant_id = assistant_id or self.config.glm_assistant_id
         body = json.dumps(
             {
@@ -199,23 +213,27 @@ class GLMWebClient:
                 "conversation_id": conversation_id,
             }
         ).encode("utf-8")
-        request = urllib.request.Request(
-            self.config.delete_conversation_url,
-            method="POST",
-            data=body,
-            headers={
-                **self.auth.get_browser_headers(),
-                "Authorization": f"Bearer {access_token}",
-                "Referer": "https://chatglm.cn/main/alltoolsdetail",
-                "X-Device-Id": uuid.uuid4().hex,
-                "X-Nonce": nonce,
-                "X-Request-Id": uuid.uuid4().hex,
-                "X-Sign": sign,
-                "X-Timestamp": timestamp,
-            },
-        )
         try:
-            with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
+            def send_request(account_index: int, access_token: str):
+                timestamp, nonce, sign = build_sign()
+                request = urllib.request.Request(
+                    self.config.delete_conversation_url,
+                    method="POST",
+                    data=body,
+                    headers={
+                        **self.auth.get_browser_headers(),
+                        "Authorization": f"Bearer {access_token}",
+                        "Referer": "https://chatglm.cn/main/alltoolsdetail",
+                        "X-Device-Id": uuid.uuid4().hex,
+                        "X-Nonce": nonce,
+                        "X-Request-Id": uuid.uuid4().hex,
+                        "X-Sign": sign,
+                        "X-Timestamp": timestamp,
+                    },
+                )
+                return urllib.request.urlopen(request, timeout=self.config.request_timeout)
+
+            with self._call_with_account_failover("delete_conversation", send_request) as response: # type: ignore
                 payload = self.auth.read_json_response(response)
             status = payload.get("status", payload.get("code"))
             if status not in {0, None}:
@@ -280,23 +298,6 @@ class GLMWebClient:
             separators=(",", ":"),
         ).encode("utf-8")
 
-        timestamp, nonce, sign = build_sign()
-        access_token = self.auth.get_access_token()
-        request = urllib.request.Request(
-            self.config.chat_stream_url,
-            data=request_body,
-            method="POST",
-            headers={
-                **self.auth.get_browser_headers(),
-                "Authorization": f"Bearer {access_token}",
-                "X-Device-Id": uuid.uuid4().hex,
-                "X-Nonce": nonce,
-                "X-Request-Id": uuid.uuid4().hex,
-                "X-Sign": sign,
-                "X-Timestamp": timestamp,
-            },
-        )
-
         self.logger.info(
             "转发请求 model=%s upstream=%s stream=%s",
             requested_model,
@@ -304,27 +305,48 @@ class GLMWebClient:
             openai_payload.get("stream"),
         )
 
-        for attempt in range(self.config.glm_busy_max_retries + 1):
-            try:
-                response = urllib.request.urlopen(request, timeout=self.config.request_timeout)
-                return self._prepare_chat_response(response), assistant_id
-            except urllib.error.HTTPError as exc:
-                error_payload = self._read_error_payload(exc)
-                if self._should_retry_busy_error(exc.code, error_payload) and attempt < self.config.glm_busy_max_retries:
-                    wait_seconds = self.config.glm_busy_retry_interval
-                    self.logger.warning(
-                        "GLM 正在处理其他对话，等待重试 attempt=%s/%s wait=%.1fs",
-                        attempt + 1,
-                        self.config.glm_busy_max_retries,
-                        wait_seconds,
+        def send_request(account_index: int, access_token: str):
+            for attempt in range(self.config.glm_busy_max_retries + 1):
+                try:
+                    timestamp, nonce, sign = build_sign()
+                    request = urllib.request.Request(
+                        self.config.chat_stream_url,
+                        data=request_body,
+                        method="POST",
+                        headers={
+                            **self.auth.get_browser_headers(),
+                            "Authorization": f"Bearer {access_token}",
+                            "X-Device-Id": uuid.uuid4().hex,
+                            "X-Nonce": nonce,
+                            "X-Request-Id": uuid.uuid4().hex,
+                            "X-Sign": sign,
+                            "X-Timestamp": timestamp,
+                        },
                     )
-                    time.sleep(wait_seconds)
-                    continue
+                    return self._prepare_chat_response(
+                        urllib.request.urlopen(request, timeout=self.config.request_timeout)
+                    )
+                except urllib.error.HTTPError as exc:
+                    error_payload = self._read_error_payload(exc)
+                    if self._should_retry_busy_error(exc.code, error_payload) and attempt < self.config.glm_busy_max_retries:
+                        wait_seconds = self.config.glm_busy_retry_interval
+                        self.logger.warning(
+                            "GLM 正在处理其他对话，等待重试 attempt=%s/%s wait=%.1fs account=%s",
+                            attempt + 1,
+                            self.config.glm_busy_max_retries,
+                            wait_seconds,
+                            account_index,
+                        )
+                        time.sleep(wait_seconds)
+                        continue
 
-                message = self._build_error_message(exc.code, error_payload)
-                raise UpstreamAPIError(status_code=exc.code, message=message, payload=error_payload) from exc
+                    message = self._build_error_message(exc.code, error_payload)
+                    raise UpstreamAPIError(status_code=exc.code, message=message, payload=error_payload) from exc
 
-        raise UpstreamAPIError(status_code=429, message="GLM 长时间忙碌，请稍后重试。")
+            raise UpstreamAPIError(status_code=429, message="GLM 长时间忙碌，请稍后重试。")
+
+        response = self._call_with_account_failover(f"chat:{requested_model}", send_request)
+        return response, assistant_id
 
     def _open_image_stream(self, payload: dict[str, object]):
         prompt = str(payload.get("prompt", "")).strip()
@@ -368,23 +390,6 @@ class GLMWebClient:
             separators=(",", ":"),
         ).encode("utf-8")
 
-        timestamp, nonce, sign = build_sign()
-        access_token = self.auth.get_access_token()
-        request = urllib.request.Request(
-            self.config.chat_stream_url,
-            data=request_body,
-            method="POST",
-            headers={
-                **self.auth.get_browser_headers(),
-                "Authorization": f"Bearer {access_token}",
-                "X-Device-Id": uuid.uuid4().hex,
-                "X-Nonce": nonce,
-                "X-Request-Id": uuid.uuid4().hex,
-                "X-Sign": sign,
-                "X-Timestamp": timestamp,
-            },
-        )
-
         self.logger.info(
             "转发绘图请求 model=%s assistant_id=%s size=%s n=%s",
             user_model,
@@ -393,13 +398,31 @@ class GLMWebClient:
             payload.get("n", 1),
         )
 
-        try:
-            response = urllib.request.urlopen(request, timeout=self.config.request_timeout)
-            return self._prepare_chat_response(response), self.config.glm_image_assistant_id
-        except urllib.error.HTTPError as exc:
-            error_payload = self._read_error_payload(exc)
-            message = self._build_error_message(exc.code, error_payload)
-            raise UpstreamAPIError(status_code=exc.code, message=message, payload=error_payload) from exc
+        def send_request(account_index: int, access_token: str):
+            timestamp, nonce, sign = build_sign()
+            request = urllib.request.Request(
+                self.config.chat_stream_url,
+                data=request_body,
+                method="POST",
+                headers={
+                    **self.auth.get_browser_headers(),
+                    "Authorization": f"Bearer {access_token}",
+                    "X-Device-Id": uuid.uuid4().hex,
+                    "X-Nonce": nonce,
+                    "X-Request-Id": uuid.uuid4().hex,
+                    "X-Sign": sign,
+                    "X-Timestamp": timestamp,
+                },
+            )
+            try:
+                return self._prepare_chat_response(urllib.request.urlopen(request, timeout=self.config.request_timeout))
+            except urllib.error.HTTPError as exc:
+                error_payload = self._read_error_payload(exc)
+                message = self._build_error_message(exc.code, error_payload)
+                raise UpstreamAPIError(status_code=exc.code, message=message, payload=error_payload) from exc
+
+        response = self._call_with_account_failover(f"image:{user_model}", send_request)
+        return response, self.config.glm_image_assistant_id
 
     def _prepare_chat_response(self, response):
         content_type = response.headers.get("Content-Type", "").lower()
@@ -530,7 +553,13 @@ class GLMWebClient:
                 return None
 
         while True:
-            raw_chunk = response.read(4096)
+            stop_after_chunk = False
+            try:
+                raw_chunk = response.read(4096)
+            except http.client.IncompleteRead as exc:
+                raw_chunk = exc.partial or b""
+                stop_after_chunk = True
+                self.logger.warning("上游 SSE 连接提前断开，按已接收内容收尾 bytes=%s", len(raw_chunk))
             if not raw_chunk:
                 break
 
@@ -543,6 +572,9 @@ class GLMWebClient:
                     return
                 if event is not None:
                     yield event
+
+            if stop_after_chunk:
+                break
 
         if pending.strip():
             event = emit_block(pending.strip())
@@ -578,26 +610,29 @@ class GLMWebClient:
             filename, mime_type, payload = self._fetch_file_payload(file_url)
             boundary = _make_boundary()
             body = self._build_multipart(boundary, filename, mime_type, payload)
-            timestamp, nonce, sign = build_sign()
-            access_token = self.auth.get_access_token()
             upload_url = f"{self.config.glm_base_url}{FILE_UPLOAD_URL_SUFFIX}"
-            request = urllib.request.Request(
-                upload_url,
-                method="POST",
-                data=body,
-                headers={
-                    **self.auth.get_browser_headers(),
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": f"multipart/form-data; boundary={boundary}",
-                    "Referer": "https://chatglm.cn/",
-                    "X-Device-Id": uuid.uuid4().hex,
-                    "X-Nonce": nonce,
-                    "X-Request-Id": uuid.uuid4().hex,
-                    "X-Sign": sign,
-                    "X-Timestamp": timestamp,
-                },
-            )
-            with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
+
+            def send_request(account_index: int, access_token: str):
+                timestamp, nonce, sign = build_sign()
+                request = urllib.request.Request(
+                    upload_url,
+                    method="POST",
+                    data=body,
+                    headers={
+                        **self.auth.get_browser_headers(),
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": f"multipart/form-data; boundary={boundary}",
+                        "Referer": "https://chatglm.cn/",
+                        "X-Device-Id": uuid.uuid4().hex,
+                        "X-Nonce": nonce,
+                        "X-Request-Id": uuid.uuid4().hex,
+                        "X-Sign": sign,
+                        "X-Timestamp": timestamp,
+                    },
+                )
+                return urllib.request.urlopen(request, timeout=self.config.request_timeout)
+
+            with self._call_with_account_failover("file_upload", send_request) as response: # type: ignore
                 result = self.auth.read_json_response(response).get("result", {})
             source_id = result.get("source_id") # type: ignore
             file_result_url = result.get("file_url", file_url) # type: ignore
@@ -678,3 +713,25 @@ class GLMWebClient:
         if rid:
             parts.append(f"rid={rid}")
         return " | ".join(parts)
+
+    def _call_with_account_failover(self, request_name: str, operation: Callable[[int, str], object]):
+        account_count = self.auth.get_account_count()
+        start_index = self.auth.get_current_account_index()
+        last_exc: Exception | None = None
+
+        for offset in range(account_count):
+            account_index = (start_index + offset) % account_count
+            try:
+                access_token = self.auth.get_access_token_for_account(account_index)
+                return operation(account_index, access_token)
+            except Exception as exc:
+                last_exc = exc
+                if not self.auth.should_switch_account(exc) or account_count == 1:
+                    raise
+                self.auth.invalidate_account(account_index)
+                self.auth.advance_account(account_index, f"{request_name}: {exc}")
+
+        self.auth.reset_account_cycle()
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"账号轮换失败：{request_name}")
