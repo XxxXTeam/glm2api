@@ -88,15 +88,25 @@ GLM_REFRESH_TOKEN=你的_refresh_token
 
 ## 4. 启动服务
 
-直接运行：
+### 拉取源代码
 
-```powershell
+```bash
+git clone https://github.com/XxxXTeam/glm2api.git
+```
+### 安装依赖
+
+```bash
+uv sync
+```
+### 运行项目
+
+```bash
 uv run .\main.py
 ```
 
 或者：
 
-```powershell
+```bash
 .\.venv\Scripts\python.exe main.py
 ```
 
