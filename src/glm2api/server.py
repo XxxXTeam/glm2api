@@ -21,6 +21,10 @@ class GLM2APIServer:
     def serve_forever(self) -> None:
         self._server.serve_forever()
 
+    def shutdown(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
     def _build_handler(self):
         config = self.config
         glm_client = self.glm_client
