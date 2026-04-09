@@ -28,6 +28,7 @@ class GLM2APIServer:
 
         class RequestHandler(BaseHTTPRequestHandler):
             server_version = "glm2api/0.1.0"
+            protocol_version = "HTTP/1.1"
 
             def do_OPTIONS(self) -> None:
                 self.send_response(HTTPStatus.NO_CONTENT)
@@ -81,7 +82,6 @@ class GLM2APIServer:
 
                     result, conversation_id = glm_client.chat_completion(payload)
                     self._write_json(HTTPStatus.OK, result)
-                    glm_client.delete_conversation(conversation_id or "")
                 except QueueTimeoutError as exc:
                     logger.warning("GLM 队列等待超时 error=%s", exc)
                     self._write_json(
@@ -107,13 +107,20 @@ class GLM2APIServer:
                 self._send_common_headers()
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
+                self.send_header("Connection", "close")
                 self.end_headers()
 
+                sent_done = False
                 for chunk in stream_iter:
                     if chunk:
                         self.wfile.write(chunk)
                         self.wfile.flush()
+                        if b"data: [DONE]\n\n" in chunk:
+                            sent_done = True
+
+                if not sent_done:
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
                 logger.info("流式请求完成 model=%s", payload.get("model"))
 
             def _authorize(self) -> bool:

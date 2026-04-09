@@ -76,6 +76,7 @@ def parse_aliases(value: str | None) -> dict[str, str]:
 
 @dataclass(slots=True)
 class AppConfig:
+    env_file_path: Path
     host: str
     port: int
     api_prefix: str
@@ -116,6 +117,7 @@ def load_config(env_file: str = ".env") -> AppConfig:
         model_aliases = {name: name for name in exposed_models}
 
     config = AppConfig(
+        env_file_path=Path(env_file),
         host=values.get("HOST", "127.0.0.1"),
         port=parse_int(values.get("PORT"), 8000),
         api_prefix=values.get("API_PREFIX", "/v1").rstrip("/") or "/v1",

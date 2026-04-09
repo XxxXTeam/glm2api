@@ -96,7 +96,7 @@ class GLMWebClient:
     def chat_completion(self, payload: dict[str, object]) -> tuple[dict[str, object], str | None]:
         lease = self.request_queue.acquire(f"chat:{payload.get('model', 'unknown')}")
         try:
-            response = self._open_chat_stream(payload)
+            response, assistant_id = self._open_chat_stream(payload)
         except Exception:
             lease.release()
             raise
@@ -111,13 +111,14 @@ class GLMWebClient:
                     return accumulator.build_response(), accumulator.conversation_id
         finally:
             response.close()
+            self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
             lease.release()
         return accumulator.build_response(), accumulator.conversation_id
 
     def stream_chat_completion(self, payload: dict[str, object]):
         lease = self.request_queue.acquire(f"stream:{payload.get('model', 'unknown')}")
         try:
-            response = self._open_chat_stream(payload)
+            response, assistant_id = self._open_chat_stream(payload)
         except Exception:
             lease.release()
             raise
@@ -145,20 +146,24 @@ class GLMWebClient:
                     yield chunk.encode("utf-8")
             finally:
                 response.close()
-                self.delete_conversation(accumulator.conversation_id)
+                self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
                 lease.release()
 
         return generate()
 
-    def delete_conversation(self, conversation_id: str) -> None:
-        if not conversation_id or not self.config.glm_delete_conversation:
+    def delete_conversation(self, conversation_id: str, assistant_id: str | None = None) -> None:
+        if not self.config.glm_delete_conversation:
+            return
+        if not conversation_id:
+            self.logger.warning("跳过删除 GLM 会话：未获取到 conversation_id assistant_id=%s", assistant_id or self.config.glm_assistant_id)
             return
 
         timestamp, nonce, sign = build_sign()
         access_token = self.auth.get_access_token()
+        actual_assistant_id = assistant_id or self.config.glm_assistant_id
         body = json.dumps(
             {
-                "assistant_id": self.config.glm_assistant_id,
+                "assistant_id": actual_assistant_id,
                 "conversation_id": conversation_id,
             }
         ).encode("utf-8")
@@ -178,10 +183,29 @@ class GLMWebClient:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.config.request_timeout):
-                self.logger.debug("已删除 GLM 会话 conversation_id=%s", conversation_id)
+            with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
+                payload = self.auth.read_json_response(response)
+            status = payload.get("status", payload.get("code"))
+            if status not in {0, None}:
+                self.logger.warning(
+                    "GLM 会话删除返回非成功状态 conversation_id=%s assistant_id=%s payload=%s",
+                    conversation_id,
+                    actual_assistant_id,
+                    payload,
+                )
+                return
+            self.logger.info(
+                "已删除 GLM 会话 conversation_id=%s assistant_id=%s",
+                conversation_id,
+                actual_assistant_id,
+            )
         except Exception as exc:
-            self.logger.warning("删除 GLM 会话失败 conversation_id=%s error=%s", conversation_id, exc)
+            self.logger.warning(
+                "删除 GLM 会话失败 conversation_id=%s assistant_id=%s error=%s",
+                conversation_id,
+                actual_assistant_id,
+                exc,
+            )
 
     def _open_chat_stream(self, openai_payload: dict[str, object]):
         requested_model = str(openai_payload.get("model", "glm-4"))
@@ -251,7 +275,7 @@ class GLMWebClient:
         for attempt in range(self.config.glm_busy_max_retries + 1):
             try:
                 response = urllib.request.urlopen(request, timeout=self.config.request_timeout)
-                return self._prepare_chat_response(response)
+                return self._prepare_chat_response(response), assistant_id
             except urllib.error.HTTPError as exc:
                 error_payload = self._read_error_payload(exc)
                 if self._should_retry_busy_error(exc.code, error_payload) and attempt < self.config.glm_busy_max_retries:

@@ -10,6 +10,7 @@ import uuid
 import urllib.request
 from dataclasses import dataclass
 from logging import Logger
+from pathlib import Path
 
 from ..config import AppConfig
 
@@ -41,6 +42,7 @@ class GLMAccessTokenManager:
         self.logger = logger
         self._cached: AccessToken | None = None
         self._lock = threading.Lock()
+        self._persist_lock = threading.Lock()
 
     def get_browser_headers(self) -> dict[str, str]:
         return {
@@ -109,9 +111,36 @@ class GLMAccessTokenManager:
         if response.status != 200 or code not in {0, None} or not access_token:
             raise RuntimeError(f"刷新 GLM token 失败: {payload}")
         if refresh_token != self.config.glm_refresh_token:
-            self.logger.warning("GLM 返回了新的 refresh_token，但当前实现只保存在内存中，请手动更新 .env。")
+            self._persist_refresh_token(refresh_token)
+            self.config.glm_refresh_token = refresh_token
+            self.logger.info("GLM refresh_token 已自动刷新并写回 .env")
         return AccessToken(
             access_token=access_token,
             refresh_token=refresh_token,
             expires_at=time.time() + ACCESS_TOKEN_EXPIRES_SECONDS - random.randint(10, 30),
         )
+
+    def _persist_refresh_token(self, refresh_token: str) -> None:
+        env_path = self.config.env_file_path
+        if not env_path.exists():
+            self.logger.warning(".env 文件不存在，无法自动写回新的 refresh_token")
+            return
+
+        with self._persist_lock:
+            content = env_path.read_text(encoding="utf-8")
+            lines = content.splitlines()
+            updated = False
+
+            for index, line in enumerate(lines):
+                if line.startswith("GLM_REFRESH_TOKEN="):
+                    lines[index] = f"GLM_REFRESH_TOKEN={refresh_token}"
+                    updated = True
+                    break
+
+            if not updated:
+                if lines and lines[-1].strip():
+                    lines.append("")
+                lines.append(f"GLM_REFRESH_TOKEN={refresh_token}")
+
+            new_content = "\n".join(lines) + "\n"
+            env_path.write_text(new_content, encoding="utf-8")
