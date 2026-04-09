@@ -7,6 +7,7 @@ from pathlib import Path
 
 DEFAULT_ASSISTANT_ID = "65940acff94777010aa6b796"
 DEFAULT_IMAGE_ASSISTANT_ID = "65a232c082ff90a2ad2f15e2"
+DEFAULT_IMAGE_MODEL_NAME = "glm-image-1"
 DEFAULT_GLM_BASE_URL = "https://chatglm.cn/chatglm"
 DEFAULT_EXPOSED_MODELS = (
     "glm-4",
@@ -15,6 +16,7 @@ DEFAULT_EXPOSED_MODELS = (
     "glm-4v",
     "glm-zero-preview",
     "glm-deep-research",
+    DEFAULT_IMAGE_MODEL_NAME,
 )
 
 
@@ -87,6 +89,7 @@ class AppConfig:
     glm_refresh_token: str
     glm_assistant_id: str
     glm_image_assistant_id: str
+    glm_image_model_name: str
     glm_user_agent: str
     glm_delete_conversation: bool
     glm_queue_wait_timeout: int
@@ -113,10 +116,15 @@ class AppConfig:
 def load_config(env_file: str = ".env") -> AppConfig:
     file_values = parse_dotenv(Path(env_file))
     values = {**file_values, **os.environ}
+    image_model_name = values.get("GLM_IMAGE_MODEL_NAME", DEFAULT_IMAGE_MODEL_NAME).strip() or DEFAULT_IMAGE_MODEL_NAME
     model_aliases = parse_aliases(values.get("GLM_MODEL_ALIASES"))
     exposed_models = parse_list(values.get("EXPOSED_MODELS"), DEFAULT_EXPOSED_MODELS)
+    if image_model_name not in exposed_models:
+        exposed_models.append(image_model_name)
     if not model_aliases:
         model_aliases = {name: name for name in exposed_models}
+    elif image_model_name not in model_aliases:
+        model_aliases[image_model_name] = image_model_name
 
     config = AppConfig(
         env_file_path=Path(env_file),
@@ -129,6 +137,7 @@ def load_config(env_file: str = ".env") -> AppConfig:
         glm_refresh_token=values.get("GLM_REFRESH_TOKEN", "").strip(),
         glm_assistant_id=values.get("GLM_ASSISTANT_ID", DEFAULT_ASSISTANT_ID).strip(),
         glm_image_assistant_id=values.get("GLM_IMAGE_ASSISTANT_ID", DEFAULT_IMAGE_ASSISTANT_ID).strip(),
+        glm_image_model_name=image_model_name,
         glm_user_agent=values.get(
             "GLM_USER_AGENT",
             (

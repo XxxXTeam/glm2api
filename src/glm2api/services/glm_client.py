@@ -12,7 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from email.generator import _make_boundary
+from email.generator import _make_boundary # type: ignore
 from io import BufferedReader, BytesIO
 from logging import Logger
 from typing import Callable
@@ -124,14 +124,14 @@ class GLMWebClient:
         return accumulator.build_response(), accumulator.conversation_id
 
     def generate_images(self, payload: dict[str, object]) -> dict[str, object]:
-        lease = self.request_queue.acquire(f"image:{payload.get('model', 'gpt-image-1')}")
+        lease = self.request_queue.acquire(f"image:{payload.get('model', self.config.glm_image_model_name)}")
         try:
             response, assistant_id = self._open_image_stream(payload)
         except Exception:
             lease.release()
             raise
 
-        accumulator = GLMEventAccumulator(model=str(payload.get("model", "gpt-image-1")))
+        accumulator = GLMEventAccumulator(model=str(payload.get("model", self.config.glm_image_model_name)))
         try:
             for event in self._iter_sse_events(response):
                 if not event:
@@ -243,12 +243,12 @@ class GLMWebClient:
         requested_model = str(openai_payload.get("model", "glm-4"))
         upstream_model, assistant_id = resolve_upstream_model(requested_model, self.config)
         converted_messages = convert_messages(
-            messages=list(openai_payload.get("messages", [])),
-            tools=list(openai_payload.get("tools", [])) if isinstance(openai_payload.get("tools"), list) else None,
+            messages=list(openai_payload.get("messages", [])), # type: ignore
+            tools=list(openai_payload.get("tools", [])) if isinstance(openai_payload.get("tools"), list) else None, # type: ignore
         )
-        refs = self._upload_referenced_files(list(openai_payload.get("messages", [])))
+        refs = self._upload_referenced_files(list(openai_payload.get("messages", []))) # type: ignore
         if refs:
-            converted_messages[0]["content"] = refs + list(converted_messages[0]["content"])
+            converted_messages[0]["content"] = refs + list(converted_messages[0]["content"]) # type: ignore
 
         chat_mode = resolve_chat_mode(
             model=upstream_model,
@@ -333,7 +333,7 @@ class GLMWebClient:
 
         size = str(payload.get("size", "1024x1024")).strip().lower()
         aspect_ratio = self._resolve_aspect_ratio(size)
-        user_model = str(payload.get("model", "gpt-image-1")).strip() or "gpt-image-1"
+        user_model = str(payload.get("model", self.config.glm_image_model_name)).strip() or self.config.glm_image_model_name
         request_body = json.dumps(
             {
                 "assistant_id": self.config.glm_image_assistant_id,
@@ -503,7 +503,7 @@ class GLMWebClient:
 
     def _coerce_positive_int(self, value: object, default: int, maximum: int) -> int:
         try:
-            parsed = int(value) if value is not None else default
+            parsed = int(value) if value is not None else default # type: ignore
         except (TypeError, ValueError):
             parsed = default
         return max(1, min(parsed, maximum))
@@ -599,8 +599,8 @@ class GLMWebClient:
             )
             with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
                 result = self.auth.read_json_response(response).get("result", {})
-            source_id = result.get("source_id")
-            file_result_url = result.get("file_url", file_url)
+            source_id = result.get("source_id") # type: ignore
+            file_result_url = result.get("file_url", file_url) # type: ignore
             if not source_id:
                 return None
             if is_image:

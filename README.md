@@ -66,6 +66,9 @@ GLM_REFRESH_TOKEN=你的_refresh_token
 - `GLM_IMAGE_ASSISTANT_ID`
   图片生成使用的 assistant id
 
+- `GLM_IMAGE_MODEL_NAME`
+  对外暴露给 OpenAI 客户端使用的绘图模型名，默认是 `glm-image-1`
+
 - `GLM_DELETE_CONVERSATION`
   是否在请求结束后自动删除 GLM 会话记录
 
@@ -182,7 +185,7 @@ for chunk in stream:
 ```bash
 curl http://127.0.0.1:8000/v1/images/generations \
   -H "Content-Type: application/json" \
-  -d "{\"model\":\"gpt-image-1\",\"prompt\":\"画个枫叶\",\"size\":\"1024x1024\"}"
+  -d "{\"model\":\"glm-image-1\",\"prompt\":\"画个枫叶\",\"size\":\"1024x1024\"}"
 ```
 
 ### 8.2 Python OpenAI SDK 示例
@@ -196,7 +199,7 @@ client = OpenAI(
 )
 
 image = client.images.generate(
-    model="gpt-image-1",
+    model="glm-image-1",
     prompt="画个枫叶",
     size="1024x1024",
 )
@@ -264,34 +267,4 @@ LOG_LEVEL=DEBUG
 
 ### 11.3 返回“请登录后继续使用”
 
-说明当前账号状态无效，或者 token 已失效，需要重新登录并更新 `refresh_token`。
-
-### 11.4 流式响应客户端迟迟不结束
-
-当前版本已经在服务端补齐 OpenAI 标准的 `data: [DONE]` 结束标记。如果仍有问题，请检查你的客户端是否支持标准 SSE。
-
-## 12. 目录说明
-
-```text
-src/glm2api/
-  app.py                应用入口
-  config.py             配置读取
-  logging_utils.py      日志输出
-  server.py             OpenAI 兼容 HTTP 服务
-  services/
-    glm_auth.py         token 刷新与写回
-    glm_client.py       GLM 请求转发
-    translator.py       GLM 响应转换
-  utils/
-    tool_parser.py      工具调用解析
-```
-
-## 13. 适用场景
-
-适合以下情况：
-
-- 想把 GLM 接到 OpenAI SDK
-- 想在本地工具中统一使用 OpenAI 风格接口
-- 想把 GLM 聊天和绘图一起接入现有工作流
-
-如果你后续还想扩展更多接口，可以继续在当前结构上增加路由和上游映射逻辑。
+说明当前账号状态无效，或者 token 已失效，需要重新登录并更新 `refresh_token`
