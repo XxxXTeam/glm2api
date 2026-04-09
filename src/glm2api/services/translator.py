@@ -44,9 +44,9 @@ def tools_to_prompt(tools: list[dict[str, object]]) -> str:
     ]
     for tool in tools:
         fn = tool.get("function", {})
-        name = fn.get("name", "unknown")
-        description = fn.get("description", "No description")
-        parameters = json.dumps(fn.get("parameters", {}), ensure_ascii=False, separators=(",", ":"))
+        name = fn.get("name", "unknown") # type: ignore
+        description = fn.get("description", "No description") # type: ignore
+        parameters = json.dumps(fn.get("parameters", {}), ensure_ascii=False, separators=(",", ":")) # type: ignore
         lines.append(f"Tool `{name}`: {description}. Arguments JSON schema: {parameters}")
 
     lines.extend(
@@ -75,7 +75,7 @@ def convert_messages(messages: list[dict[str, object]], tools: list[dict[str, ob
         content = message.get("content")
         if role == "assistant" and message.get("tool_calls"):
             tool_calls = []
-            for tool_call in message.get("tool_calls", []):
+            for tool_call in message.get("tool_calls", []): # pyright: ignore[reportGeneralTypeIssues]
                 function = tool_call.get("function", {})
                 tool_calls.append(
                     f"[call:{function.get('name', 'unknown')}]{function.get('arguments', '{}')}[/call]"
@@ -133,7 +133,7 @@ class GLMEventAccumulator:
         if not self.conversation_id and payload.get("conversation_id"):
             self.conversation_id = str(payload["conversation_id"])
 
-        for part in payload.get("parts", []) if isinstance(payload.get("parts"), list) else []:
+        for part in payload.get("parts", []) if isinstance(payload.get("parts"), list) else []: # pyright: ignore[reportGeneralTypeIssues]
             if isinstance(part, dict) and part.get("logic_id"):
                 self.parts_by_logic_id[str(part["logic_id"])] = part
 

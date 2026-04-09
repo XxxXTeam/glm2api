@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import json
 import random
 import threading
@@ -44,7 +45,7 @@ class GLMAccessTokenManager:
     def get_browser_headers(self) -> dict[str, str]:
         return {
             "Accept": "text/event-stream",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Encoding": "identity",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
             "App-Name": "chatglm",
             "Cache-Control": "no-cache",
@@ -66,6 +67,15 @@ class GLMAccessTokenManager:
             "X-Device-Model": "",
             "X-Lang": "zh",
         }
+
+    def read_json_response(self, response) -> dict[str, object]:
+        raw_body = response.read()
+        content_encoding = response.headers.get("Content-Encoding", "").lower()
+
+        if content_encoding == "gzip":
+            raw_body = gzip.decompress(raw_body)
+
+        return json.loads(raw_body.decode("utf-8"))
 
     def get_access_token(self) -> str:
         with self._lock:
@@ -91,7 +101,7 @@ class GLMAccessTokenManager:
             },
         )
         with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            payload = self.read_json_response(response)
         code = payload.get("code", payload.get("status"))
         result = payload.get("result") or {}
         access_token = result.get("access_token")

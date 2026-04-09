@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import mimetypes
 import uuid
@@ -8,6 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from email.generator import _make_boundary
+from io import BufferedReader
 from logging import Logger
 
 from ..config import AppConfig
@@ -164,9 +166,10 @@ class GLMWebClient:
             openai_payload.get("stream"),
         )
         try:
-            return urllib.request.urlopen(request, timeout=self.config.request_timeout)
+            response = urllib.request.urlopen(request, timeout=self.config.request_timeout)
+            return self._wrap_stream_response(response)
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore")
+            detail = self._read_error_text(exc)
             raise RuntimeError(f"GLM 请求失败 HTTP {exc.code}: {detail}") from exc
 
     def _iter_sse_events(self, response):
@@ -242,7 +245,7 @@ class GLMWebClient:
                 },
             )
             with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
-                result = json.loads(response.read().decode("utf-8")).get("result", {})
+                result = self.auth.read_json_response(response).get("result", {})
             source_id = result.get("source_id")
             file_result_url = result.get("file_url", file_url)
             if not source_id:
@@ -280,3 +283,18 @@ class GLMWebClient:
         ).encode("utf-8")
         end = f"\r\n--{boundary}--\r\n".encode("utf-8")
         return start + payload + end
+
+    def _wrap_stream_response(self, response):
+        content_encoding = response.headers.get("Content-Encoding", "").lower()
+        if content_encoding == "gzip":
+            return BufferedReader(gzip.GzipFile(fileobj=response))
+        return response
+
+    def _read_error_text(self, error: urllib.error.HTTPError) -> str:
+        raw_body = error.read()
+        content_encoding = error.headers.get("Content-Encoding", "").lower()
+
+        if content_encoding == "gzip":
+            raw_body = gzip.decompress(raw_body)
+
+        return raw_body.decode("utf-8", errors="ignore")
