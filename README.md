@@ -1,4 +1,4 @@
-# glm2api 用户手册
+# ChatGLM 2 API
 
 `glm2api` 是一个本地代理服务，用来把 `chatglm.cn` 的网页接口转换成 OpenAI 兼容接口，方便你直接接入 OpenAI SDK、Cherry Studio、Open WebUI、LobeChat 或其他兼容 OpenAI API 的工具。
 
