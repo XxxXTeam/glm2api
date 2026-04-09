@@ -46,6 +46,12 @@ def parse_int(value: str | None, default: int) -> int:
     return int(value)
 
 
+def parse_float(value: str | None, default: float) -> float:
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
 def parse_list(value: str | None, default: tuple[str, ...] = ()) -> list[str]:
     if value is None or value.strip() == "":
         return list(default)
@@ -80,6 +86,9 @@ class AppConfig:
     glm_assistant_id: str
     glm_user_agent: str
     glm_delete_conversation: bool
+    glm_queue_wait_timeout: int
+    glm_busy_max_retries: int
+    glm_busy_retry_interval: float
     exposed_models: list[str]
     model_aliases: dict[str, str]
     server_api_keys: list[str]
@@ -123,6 +132,9 @@ def load_config(env_file: str = ".env") -> AppConfig:
             ),
         ).strip(),
         glm_delete_conversation=parse_bool(values.get("GLM_DELETE_CONVERSATION"), True),
+        glm_queue_wait_timeout=parse_int(values.get("GLM_QUEUE_WAIT_TIMEOUT_SECONDS"), 600),
+        glm_busy_max_retries=parse_int(values.get("GLM_BUSY_MAX_RETRIES"), 30),
+        glm_busy_retry_interval=parse_float(values.get("GLM_BUSY_RETRY_INTERVAL_SECONDS"), 2.0),
         exposed_models=exposed_models,
         model_aliases=model_aliases,
         server_api_keys=parse_list(values.get("SERVER_API_KEYS")),

@@ -124,6 +124,8 @@ class GLMEventAccumulator:
     conversation_id: str = ""
     created: int = field(default_factory=lambda: int(time.time()))
     parts_by_logic_id: dict[str, dict[str, object]] = field(default_factory=dict)
+    last_full_text: str = ""
+    last_full_reasoning: str = ""
     visible_text_sent: int = 0
     visible_reasoning_sent: int = 0
     tool_parser: StreamingToolParser = field(default_factory=StreamingToolParser)
@@ -138,6 +140,8 @@ class GLMEventAccumulator:
                 self.parts_by_logic_id[str(part["logic_id"])] = part
 
         full_text, full_reasoning = self._render_full_output()
+        self.last_full_text = full_text
+        self.last_full_reasoning = full_reasoning
         text_delta = full_text[self.visible_text_sent :]
         reasoning_delta = full_reasoning[self.visible_reasoning_sent :]
         self.visible_text_sent = len(full_text)
@@ -262,10 +266,15 @@ class GLMEventAccumulator:
 
     def build_response(self) -> dict[str, object]:
         full_text, full_reasoning = self._render_full_output()
+        if not full_text and self.last_full_text:
+            full_text = self.last_full_text
+        if not full_reasoning and self.last_full_reasoning:
+            full_reasoning = self.last_full_reasoning
         clean_content, tool_calls = parse_tool_calls_from_text(full_text.strip())
+        final_content = clean_content.strip()
         message: dict[str, object] = {
             "role": "assistant",
-            "content": None if tool_calls else clean_content.strip(),
+            "content": None if tool_calls or not final_content else final_content,
             "reasoning_content": full_reasoning or None,
         }
         if tool_calls:

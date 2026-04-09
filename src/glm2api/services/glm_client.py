@@ -4,13 +4,17 @@ import base64
 import gzip
 import json
 import mimetypes
+import threading
+import time
 import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from email.generator import _make_boundary
-from io import BufferedReader
+from io import BufferedReader, BytesIO
 from logging import Logger
+from typing import Callable
 
 from ..config import AppConfig
 from .glm_auth import GLMAccessTokenManager, build_sign
@@ -21,14 +25,81 @@ FILE_UPLOAD_URL_SUFFIX = "/backend-api/assistant/file_upload"
 FILE_SIZE_LIMIT = 100 * 1024 * 1024
 
 
+class UpstreamAPIError(RuntimeError):
+    def __init__(self, status_code: int, message: str, payload: dict[str, object] | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.payload = payload or {}
+
+
+class QueueTimeoutError(RuntimeError):
+    pass
+
+
+@dataclass(slots=True)
+class QueueLease:
+    ticket: int
+    release_callback: Callable[[int], None]
+    released: bool = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        self.release_callback(self.ticket)
+
+
+class SerialRequestQueue:
+    def __init__(self, logger: Logger, wait_timeout: int) -> None:
+        self.logger = logger
+        self.wait_timeout = wait_timeout
+        self._condition = threading.Condition()
+        self._next_ticket = 0
+        self._serving_ticket = 0
+
+    def acquire(self, request_name: str) -> QueueLease:
+        with self._condition:
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            queue_ahead = ticket - self._serving_ticket
+            start = time.monotonic()
+
+            if queue_ahead > 0:
+                self.logger.info("请求进入 GLM 队列 ticket=%s ahead=%s request=%s", ticket, queue_ahead, request_name)
+
+            while ticket != self._serving_ticket:
+                remaining = self.wait_timeout - (time.monotonic() - start)
+                if remaining <= 0:
+                    raise QueueTimeoutError(
+                        f"GLM 队列等待超时，前方仍有 {ticket - self._serving_ticket} 个请求，请稍后重试。"
+                    )
+                self._condition.wait(timeout=remaining)
+
+            self.logger.info("请求获得 GLM 执行槽位 ticket=%s request=%s", ticket, request_name)
+            return QueueLease(ticket=ticket, release_callback=self._release)
+
+    def _release(self, ticket: int) -> None:
+        with self._condition:
+            if ticket == self._serving_ticket:
+                self._serving_ticket += 1
+                self.logger.info("请求离开 GLM 执行槽位 ticket=%s", ticket)
+                self._condition.notify_all()
+
+
 class GLMWebClient:
     def __init__(self, config: AppConfig, logger: Logger) -> None:
         self.config = config
         self.logger = logger
         self.auth = GLMAccessTokenManager(config=config, logger=logger)
+        self.request_queue = SerialRequestQueue(logger=logger, wait_timeout=config.glm_queue_wait_timeout)
 
     def chat_completion(self, payload: dict[str, object]) -> tuple[dict[str, object], str | None]:
-        response = self._open_chat_stream(payload)
+        lease = self.request_queue.acquire(f"chat:{payload.get('model', 'unknown')}")
+        try:
+            response = self._open_chat_stream(payload)
+        except Exception:
+            lease.release()
+            raise
         accumulator = GLMEventAccumulator(model=str(payload["model"]))
         try:
             for event in self._iter_sse_events(response):
@@ -40,33 +111,44 @@ class GLMWebClient:
                     return accumulator.build_response(), accumulator.conversation_id
         finally:
             response.close()
+            lease.release()
         return accumulator.build_response(), accumulator.conversation_id
 
     def stream_chat_completion(self, payload: dict[str, object]):
-        response = self._open_chat_stream(payload)
+        lease = self.request_queue.acquire(f"stream:{payload.get('model', 'unknown')}")
+        try:
+            response = self._open_chat_stream(payload)
+        except Exception:
+            lease.release()
+            raise
+
         accumulator = GLMEventAccumulator(model=str(payload["model"]))
 
-        try:
-            for event in self._iter_sse_events(response):
-                if not event:
-                    continue
-                chunks, status = accumulator.consume_event(event)
-                for chunk in chunks:
-                    yield chunk.encode("utf-8")
-
-                if status in {"finish", "intervene"}:
-                    for chunk in accumulator.finalize(
-                        status=status,
-                        last_error=event.get("last_error") if isinstance(event.get("last_error"), dict) else None,
-                    ):
+        def generate():
+            try:
+                for event in self._iter_sse_events(response):
+                    if not event:
+                        continue
+                    chunks, status = accumulator.consume_event(event)
+                    for chunk in chunks:
                         yield chunk.encode("utf-8")
-                    return
-        finally:
-            response.close()
-            self.delete_conversation(accumulator.conversation_id)
 
-        for chunk in accumulator.finalize(status="stop"):
-            yield chunk.encode("utf-8")
+                    if status in {"finish", "intervene"}:
+                        for chunk in accumulator.finalize(
+                            status=status,
+                            last_error=event.get("last_error") if isinstance(event.get("last_error"), dict) else None,
+                        ):
+                            yield chunk.encode("utf-8")
+                        return
+
+                for chunk in accumulator.finalize(status="stop"):
+                    yield chunk.encode("utf-8")
+            finally:
+                response.close()
+                self.delete_conversation(accumulator.conversation_id)
+                lease.release()
+
+        return generate()
 
     def delete_conversation(self, conversation_id: str) -> None:
         if not conversation_id or not self.config.glm_delete_conversation:
@@ -165,36 +247,82 @@ class GLMWebClient:
             upstream_model,
             openai_payload.get("stream"),
         )
-        try:
-            response = urllib.request.urlopen(request, timeout=self.config.request_timeout)
-            return self._wrap_stream_response(response)
-        except urllib.error.HTTPError as exc:
-            detail = self._read_error_text(exc)
-            raise RuntimeError(f"GLM 请求失败 HTTP {exc.code}: {detail}") from exc
+
+        for attempt in range(self.config.glm_busy_max_retries + 1):
+            try:
+                response = urllib.request.urlopen(request, timeout=self.config.request_timeout)
+                return self._prepare_chat_response(response)
+            except urllib.error.HTTPError as exc:
+                error_payload = self._read_error_payload(exc)
+                if self._should_retry_busy_error(exc.code, error_payload) and attempt < self.config.glm_busy_max_retries:
+                    wait_seconds = self.config.glm_busy_retry_interval
+                    self.logger.warning(
+                        "GLM 正在处理其他对话，等待重试 attempt=%s/%s wait=%.1fs",
+                        attempt + 1,
+                        self.config.glm_busy_max_retries,
+                        wait_seconds,
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+
+                message = self._build_error_message(exc.code, error_payload)
+                raise UpstreamAPIError(status_code=exc.code, message=message, payload=error_payload) from exc
+
+        raise UpstreamAPIError(status_code=429, message="GLM 长时间忙碌，请稍后重试。")
+
+    def _prepare_chat_response(self, response):
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "application/json" in content_type:
+            payload = self.auth.read_json_response(response)
+            status = payload.get("status")
+            message = str(payload.get("message", "")).strip()
+            if status not in (0, None) or message:
+                raise UpstreamAPIError(
+                    status_code=502,
+                    message=self._build_error_message(200, payload),
+                    payload=payload,
+                )
+
+            response_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            return BufferedReader(BytesIO(response_body))
+
+        return self._wrap_stream_response(response)
 
     def _iter_sse_events(self, response):
-        buffer: list[str] = []
+        pending = ""
+
+        def emit_block(block: str):
+            lines = [line for line in block.split("\n") if line.startswith("data:")]
+            if not lines:
+                return None
+            payload = "\n".join(line[5:].strip() for line in lines)
+            if payload == "[DONE]":
+                return "[DONE]"
+            try:
+                return json.loads(payload)
+            except json.JSONDecodeError:
+                self.logger.debug("忽略无法解析的 SSE 片段: %s", payload)
+                return None
+
         while True:
-            raw_line = response.readline()
-            if not raw_line:
+            raw_chunk = response.read(4096)
+            if not raw_chunk:
                 break
 
-            line = raw_line.decode("utf-8", errors="ignore")
-            if line in ("\n", "\r\n"):
-                data_lines = [item[5:].strip() for item in buffer if item.startswith("data:")]
-                buffer.clear()
-                if not data_lines:
-                    continue
-                payload = "\n".join(data_lines)
-                if payload == "[DONE]":
-                    return
-                try:
-                    yield json.loads(payload)
-                except json.JSONDecodeError:
-                    self.logger.debug("忽略无法解析的 SSE 片段: %s", payload)
-                continue
+            pending += raw_chunk.decode("utf-8", errors="ignore").replace("\r\n", "\n")
 
-            buffer.append(line.rstrip("\r\n"))
+            while "\n\n" in pending:
+                block, pending = pending.split("\n\n", 1)
+                event = emit_block(block.strip())
+                if event == "[DONE]":
+                    return
+                if event is not None:
+                    yield event
+
+        if pending.strip():
+            event = emit_block(pending.strip())
+            if event not in (None, "[DONE]"):
+                yield event
 
     def _upload_referenced_files(self, messages: list[dict[str, object]]) -> list[dict[str, object]]:
         refs: list[dict[str, object]] = []
@@ -290,11 +418,38 @@ class GLMWebClient:
             return BufferedReader(gzip.GzipFile(fileobj=response))
         return response
 
-    def _read_error_text(self, error: urllib.error.HTTPError) -> str:
+    def _read_error_payload(self, error: urllib.error.HTTPError) -> dict[str, object]:
         raw_body = error.read()
         content_encoding = error.headers.get("Content-Encoding", "").lower()
 
         if content_encoding == "gzip":
             raw_body = gzip.decompress(raw_body)
 
-        return raw_body.decode("utf-8", errors="ignore")
+        text = raw_body.decode("utf-8", errors="ignore")
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                return payload
+        except json.JSONDecodeError:
+            pass
+        return {"message": text}
+
+    def _should_retry_busy_error(self, status_code: int, payload: dict[str, object]) -> bool:
+        if status_code != 429:
+            return False
+        message = str(payload.get("message", ""))
+        inner_status = payload.get("status")
+        return inner_status == 10061 or "请等待其他对话生成完毕" in message
+
+    def _build_error_message(self, status_code: int, payload: dict[str, object]) -> str:
+        message = str(payload.get("message", "")).strip()
+        inner_status = payload.get("status")
+        rid = payload.get("rid")
+        parts = [f"GLM 请求失败 HTTP {status_code}"]
+        if inner_status is not None:
+            parts.append(f"status={inner_status}")
+        if message:
+            parts.append(message)
+        if rid:
+            parts.append(f"rid={rid}")
+        return " | ".join(parts)

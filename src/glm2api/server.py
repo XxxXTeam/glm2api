@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging import Logger
 
 from .config import AppConfig
-from .services.glm_client import GLMWebClient
+from .services.glm_client import GLMWebClient, QueueTimeoutError, UpstreamAPIError
 
 
 class GLM2APIServer:
@@ -82,6 +82,18 @@ class GLM2APIServer:
                     result, conversation_id = glm_client.chat_completion(payload)
                     self._write_json(HTTPStatus.OK, result)
                     glm_client.delete_conversation(conversation_id or "")
+                except QueueTimeoutError as exc:
+                    logger.warning("GLM 队列等待超时 error=%s", exc)
+                    self._write_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"error": {"message": str(exc), "type": "queue_timeout"}},
+                    )
+                except UpstreamAPIError as exc:
+                    logger.warning("上游 GLM 返回错误 status=%s error=%s", exc.status_code, exc)
+                    self._write_json(
+                        HTTPStatus(exc.status_code),
+                        {"error": {"message": str(exc), "type": "upstream_error", "details": exc.payload}},
+                    )
                 except Exception as exc:
                     logger.error("处理请求失败 error=%s\n%s", exc, traceback.format_exc())
                     self._write_json(
@@ -90,6 +102,7 @@ class GLM2APIServer:
                     )
 
             def _stream_completion(self, payload: dict[str, object]) -> None:
+                stream_iter = glm_client.stream_chat_completion(payload)
                 self.send_response(HTTPStatus.OK)
                 self._send_common_headers()
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -97,7 +110,7 @@ class GLM2APIServer:
                 self.send_header("Connection", "keep-alive")
                 self.end_headers()
 
-                for chunk in glm_client.stream_chat_completion(payload):
+                for chunk in stream_iter:
                     if chunk:
                         self.wfile.write(chunk)
                         self.wfile.flush()
