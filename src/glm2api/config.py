@@ -10,16 +10,23 @@ DEFAULT_IMAGE_ASSISTANT_ID = "65a232c082ff90a2ad2f15e2"
 DEFAULT_IMAGE_MODEL_NAME = "glm-image-1"
 DEFAULT_GLM_BASE_URL = "https://chatglm.cn/chatglm"
 BUILTIN_EXPOSED_MODELS = (
+    "cogView-4-250304",
     "glm-5.1",
+    "glm-5v-turbo",
     "glm-5-turbo",
     "glm-5",
+    "glm-4.7-flash",
     "glm-4.7",
+    "glm-4.6v-flash",
     "glm-4.6",
     "glm-4.5",
+    "glm-4.1v-thinking-flashx",
     "glm-4",
     "glm-4-flash",
     "glm-4-air",
     "glm-4v",
+    "glm-4-flashx-250414",
+    "glm-4-flash-250414",
     "glm-zero-preview",
     "glm-deep-research",
     DEFAULT_IMAGE_MODEL_NAME,
