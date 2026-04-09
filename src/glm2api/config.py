@@ -10,6 +10,8 @@ DEFAULT_IMAGE_ASSISTANT_ID = "65a232c082ff90a2ad2f15e2"
 DEFAULT_IMAGE_MODEL_NAME = "glm-image-1"
 DEFAULT_GLM_BASE_URL = "https://chatglm.cn/chatglm"
 DEFAULT_EXPOSED_MODELS = (
+    "glm-5.1",
+    "glm-5",
     "glm-4",
     "glm-4-flash",
     "glm-4-air",
