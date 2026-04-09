@@ -61,7 +61,10 @@ class GLM2APIServer:
 
             def do_POST(self) -> None:
                 try:
-                    if self.path != f"{config.api_prefix}/chat/completions":
+                    if self.path not in {
+                        f"{config.api_prefix}/chat/completions",
+                        f"{config.api_prefix}/images/generations",
+                    }:
                         self._write_json(HTTPStatus.NOT_FOUND, {"error": {"message": "Not Found"}})
                         return
 
@@ -72,6 +75,17 @@ class GLM2APIServer:
                     content_length = int(self.headers.get("Content-Length", "0"))
                     raw_body = self.rfile.read(content_length) if content_length else b"{}"
                     payload = json.loads(raw_body.decode("utf-8"))
+
+                    if self.path == f"{config.api_prefix}/images/generations":
+                        if not payload.get("prompt"):
+                            self._write_json(
+                                HTTPStatus.BAD_REQUEST,
+                                {"error": {"message": "图片生成请求必须包含 prompt 字段。"}},
+                            )
+                            return
+                        result = glm_client.generate_images(payload)
+                        self._write_json(HTTPStatus.OK, result)
+                        return
 
                     if not isinstance(payload.get("messages"), list) or not payload.get("model"):
                         self._write_json(

@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 DEFAULT_ASSISTANT_ID = "65940acff94777010aa6b796"
+DEFAULT_IMAGE_ASSISTANT_ID = "65a232c082ff90a2ad2f15e2"
 DEFAULT_GLM_BASE_URL = "https://chatglm.cn/chatglm"
 DEFAULT_EXPOSED_MODELS = (
     "glm-4",
@@ -85,6 +86,7 @@ class AppConfig:
     glm_base_url: str
     glm_refresh_token: str
     glm_assistant_id: str
+    glm_image_assistant_id: str
     glm_user_agent: str
     glm_delete_conversation: bool
     glm_queue_wait_timeout: int
@@ -126,6 +128,7 @@ def load_config(env_file: str = ".env") -> AppConfig:
         glm_base_url=values.get("GLM_BASE_URL", DEFAULT_GLM_BASE_URL).rstrip("/"),
         glm_refresh_token=values.get("GLM_REFRESH_TOKEN", "").strip(),
         glm_assistant_id=values.get("GLM_ASSISTANT_ID", DEFAULT_ASSISTANT_ID).strip(),
+        glm_image_assistant_id=values.get("GLM_IMAGE_ASSISTANT_ID", DEFAULT_IMAGE_ASSISTANT_ID).strip(),
         glm_user_agent=values.get(
             "GLM_USER_AGENT",
             (

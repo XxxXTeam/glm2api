@@ -4,6 +4,7 @@ import base64
 import gzip
 import json
 import mimetypes
+import re
 import threading
 import time
 import uuid
@@ -23,6 +24,13 @@ from .translator import GLMEventAccumulator, convert_messages, resolve_chat_mode
 
 FILE_UPLOAD_URL_SUFFIX = "/backend-api/assistant/file_upload"
 FILE_SIZE_LIMIT = 100 * 1024 * 1024
+IMAGE_SIZE_TO_ASPECT_RATIO = {
+    "1024x1024": "1:1",
+    "1024x1536": "2:3",
+    "1536x1024": "3:2",
+    "1024x1792": "9:16",
+    "1792x1024": "16:9",
+}
 
 
 class UpstreamAPIError(RuntimeError):
@@ -114,6 +122,30 @@ class GLMWebClient:
             self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
             lease.release()
         return accumulator.build_response(), accumulator.conversation_id
+
+    def generate_images(self, payload: dict[str, object]) -> dict[str, object]:
+        lease = self.request_queue.acquire(f"image:{payload.get('model', 'gpt-image-1')}")
+        try:
+            response, assistant_id = self._open_image_stream(payload)
+        except Exception:
+            lease.release()
+            raise
+
+        accumulator = GLMEventAccumulator(model=str(payload.get("model", "gpt-image-1")))
+        try:
+            for event in self._iter_sse_events(response):
+                if not event:
+                    continue
+                status = event.get("status")
+                accumulator.consume_event(event)
+                if status == "finish":
+                    return self._build_images_response(payload, event, accumulator)
+
+            return self._build_images_response(payload, {}, accumulator)
+        finally:
+            response.close()
+            self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
+            lease.release()
 
     def stream_chat_completion(self, payload: dict[str, object]):
         lease = self.request_queue.acquire(f"stream:{payload.get('model', 'unknown')}")
@@ -294,6 +326,81 @@ class GLMWebClient:
 
         raise UpstreamAPIError(status_code=429, message="GLM 长时间忙碌，请稍后重试。")
 
+    def _open_image_stream(self, payload: dict[str, object]):
+        prompt = str(payload.get("prompt", "")).strip()
+        if not prompt:
+            raise UpstreamAPIError(status_code=400, message="图片生成请求缺少 prompt")
+
+        size = str(payload.get("size", "1024x1024")).strip().lower()
+        aspect_ratio = self._resolve_aspect_ratio(size)
+        user_model = str(payload.get("model", "gpt-image-1")).strip() or "gpt-image-1"
+        request_body = json.dumps(
+            {
+                "assistant_id": self.config.glm_image_assistant_id,
+                "conversation_id": "",
+                "project_id": "",
+                "chat_type": "user_chat",
+                "meta_data": {
+                    "cogview": {
+                        "aspect_ratio": aspect_ratio,
+                        "style": self._resolve_image_style(payload),
+                        "scene": self._resolve_image_scene(payload),
+                        "chat_model": "",
+                        "rm_label_watermark": False,
+                    },
+                    "is_test": False,
+                    "input_question_type": "xxxx",
+                    "channel": "",
+                    "draft_id": "",
+                    "chat_mode": "",
+                    "is_networking": False,
+                    "quote_log_id": "",
+                    "platform": "pc",
+                },
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": prompt}],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        timestamp, nonce, sign = build_sign()
+        access_token = self.auth.get_access_token()
+        request = urllib.request.Request(
+            self.config.chat_stream_url,
+            data=request_body,
+            method="POST",
+            headers={
+                **self.auth.get_browser_headers(),
+                "Authorization": f"Bearer {access_token}",
+                "X-Device-Id": uuid.uuid4().hex,
+                "X-Nonce": nonce,
+                "X-Request-Id": uuid.uuid4().hex,
+                "X-Sign": sign,
+                "X-Timestamp": timestamp,
+            },
+        )
+
+        self.logger.info(
+            "转发绘图请求 model=%s assistant_id=%s size=%s n=%s",
+            user_model,
+            self.config.glm_image_assistant_id,
+            size,
+            payload.get("n", 1),
+        )
+
+        try:
+            response = urllib.request.urlopen(request, timeout=self.config.request_timeout)
+            return self._prepare_chat_response(response), self.config.glm_image_assistant_id
+        except urllib.error.HTTPError as exc:
+            error_payload = self._read_error_payload(exc)
+            message = self._build_error_message(exc.code, error_payload)
+            raise UpstreamAPIError(status_code=exc.code, message=message, payload=error_payload) from exc
+
     def _prepare_chat_response(self, response):
         content_type = response.headers.get("Content-Type", "").lower()
         if "application/json" in content_type:
@@ -311,6 +418,100 @@ class GLMWebClient:
             return BufferedReader(BytesIO(response_body))
 
         return self._wrap_stream_response(response)
+
+    def _build_images_response(
+        self,
+        request_payload: dict[str, object],
+        final_event: dict[str, object],
+        accumulator: GLMEventAccumulator,
+    ) -> dict[str, object]:
+        requested_count = self._coerce_positive_int(request_payload.get("n"), default=1, maximum=10)
+        response_format = str(request_payload.get("response_format", "url")).strip().lower()
+        created = int(time.time())
+
+        data: list[dict[str, object]] = []
+        ordered_parts = list(accumulator.parts_by_logic_id.values())
+        ordered_parts.sort(key=lambda item: str(item.get("logic_id", "")))
+
+        for part in ordered_parts:
+            if len(data) >= requested_count:
+                break
+            if not isinstance(part, dict):
+                continue
+            part_status = str(part.get("status", ""))
+            if part_status != "finish":
+                continue
+            content_items = part.get("content", [])
+            if not isinstance(content_items, list):
+                continue
+            for content in content_items:
+                if len(data) >= requested_count:
+                    break
+                if not isinstance(content, dict) or content.get("type") != "image":
+                    continue
+                images = content.get("image", [])
+                if not isinstance(images, list):
+                    continue
+                revised_prompt = str(content.get("code", "")).strip() or None
+                for image in images:
+                    if len(data) >= requested_count:
+                        break
+                    if not isinstance(image, dict):
+                        continue
+                    image_url = str(image.get("image_url", "")).strip()
+                    if not image_url:
+                        continue
+                    item: dict[str, object] = {}
+                    if response_format == "b64_json":
+                        item["b64_json"] = self._download_image_as_base64(image_url)
+                    else:
+                        item["url"] = image_url
+                    if revised_prompt:
+                        item["revised_prompt"] = revised_prompt
+                    data.append(item)
+
+        if not data:
+            raise UpstreamAPIError(
+                status_code=502,
+                message="GLM 绘图请求已完成，但未返回可用图片结果。",
+                payload=final_event,
+            )
+
+        return {
+            "created": created,
+            "data": data,
+        }
+
+    def _resolve_aspect_ratio(self, size: str) -> str:
+        normalized = size.strip().lower()
+        if normalized in IMAGE_SIZE_TO_ASPECT_RATIO:
+            return IMAGE_SIZE_TO_ASPECT_RATIO[normalized]
+        if re.fullmatch(r"\d+x\d+", normalized):
+            width_str, height_str = normalized.split("x", 1)
+            width = max(int(width_str), 1)
+            height = max(int(height_str), 1)
+            return f"{width}:{height}"
+        return "1:1"
+
+    def _resolve_image_style(self, payload: dict[str, object]) -> str:
+        style = str(payload.get("style", "none")).strip().lower()
+        return style if style else "none"
+
+    def _resolve_image_scene(self, payload: dict[str, object]) -> str:
+        scene = str(payload.get("scene", "none")).strip().lower()
+        return scene if scene else "none"
+
+    def _coerce_positive_int(self, value: object, default: int, maximum: int) -> int:
+        try:
+            parsed = int(value) if value is not None else default
+        except (TypeError, ValueError):
+            parsed = default
+        return max(1, min(parsed, maximum))
+
+    def _download_image_as_base64(self, image_url: str) -> str:
+        with urllib.request.urlopen(image_url, timeout=self.config.request_timeout) as response:
+            image_bytes = response.read()
+        return base64.b64encode(image_bytes).decode("ascii")
 
     def _iter_sse_events(self, response):
         pending = ""
