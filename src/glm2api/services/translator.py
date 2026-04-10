@@ -15,6 +15,8 @@ ASSISTANT_ID_PATTERN = re.compile(r"^[a-z0-9]{24,}$")
 def extract_text_content(content: object) -> str:
     if isinstance(content, str):
         return content
+    if isinstance(content, (dict, list)):
+        return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
     if not isinstance(content, list):
         return ""
 
@@ -37,9 +39,11 @@ def extract_text_content(content: object) -> str:
 def tools_to_prompt(tools: list[dict[str, object]]) -> str:
     lines = [
         "## Available Tools",
-        "You can invoke the following developer tools. Call a tool only when it is required and follow the JSON schema exactly when providing arguments.",
+        "You can invoke the following developer tools. Call a tool whenever the task needs external capability, web interaction, file operations, code execution, or structured retrieval.",
         "",
         "CRITICAL: Tool names are CASE-SENSITIVE. You MUST use the exact tool name as defined below.",
+        "CRITICAL: Respect the provided JSON schema. Do not invent fields. Do not rename fields.",
+        "CRITICAL: If a tool is necessary, prefer calling the tool instead of guessing.",
         "",
     ]
     for tool in tools:
@@ -60,9 +64,29 @@ def tools_to_prompt(tools: list[dict[str, object]]) -> str:
             "[/function_calls]",
             "",
             "GLM STRICT RULES:",
-            "- If the task needs file edits, shell execution, or structured tool usage, call tools instead of narrating.",
-            "- The JSON arguments must stay on one line.",
-            "- Do not add any extra explanation outside the [function_calls] block.",
+            "- If the task needs file edits, shell execution, web browsing, searching, fetching, or structured tool usage, call tools instead of narrating.",
+            "- Put every tool call inside the SAME [function_calls] block.",
+            "- You MAY emit MULTIPLE [call:tool_name]{...}[/call] entries in one [function_calls] block when the calls are all required.",
+            "- The JSON arguments must stay on one line and must be valid JSON objects.",
+            "- If you need no tools, answer normally with plain text.",
+            "- Do not mix normal prose with a [function_calls] block in the same assistant turn.",
+            "- After tool results are provided, continue the task using those results. Only call more tools if still necessary.",
+            "",
+            "## Web2API Guidance",
+            "- For webpage understanding, prefer tools over pretending you have already seen the page.",
+            "- For structured extraction, call tools with complete arguments rather than partial placeholders.",
+            "- For multi-step web tasks, prefer a sequence of precise tool calls instead of one vague call.",
+            "- If the user provides tools, you should actively use them when they materially improve correctness.",
+            "",
+            "## Good Examples",
+            "[function_calls]",
+            '[call:browser_navigate]{\"url\":\"https://example.com\"}[/call]',
+            "[/function_calls]",
+            "",
+            "[function_calls]",
+            '[call:search]{\"query\":\"OpenAI API docs\",\"max_results\":5}[/call]',
+            '[call:fetch]{\"url\":\"https://example.com/data.json\"}[/call]',
+            "[/function_calls]",
         ]
     )
     return "\n".join(lines)
@@ -80,16 +104,29 @@ def convert_messages(messages: list[dict[str, object]], tools: list[dict[str, ob
                 tool_calls.append(
                     f"[call:{function.get('name', 'unknown')}]{function.get('arguments', '{}')}[/call]"
                 )
-            content = "[function_calls]\n" + "\n".join(tool_calls) + "\n[/function_calls]"
+            assistant_text = extract_text_content(content).strip()
+            block = "[function_calls]\n" + "\n".join(tool_calls) + "\n[/function_calls]"
+            content = f"{assistant_text}\n{block}".strip() if assistant_text else block
         elif role == "tool":
             role = "user"
-            content = f"[TOOL_RESULT for {message.get('tool_call_id', 'unknown')}] {extract_text_content(content)}"
+            tool_name = str(message.get("name", "")).strip() or "unknown_tool"
+            tool_result_text = extract_text_content(content)
+            content = (
+                f"[TOOL_RESULT id={message.get('tool_call_id', 'unknown')} name={tool_name}]\n"
+                f"{tool_result_text}"
+            )
 
         processed.append({"role": role, "content": extract_text_content(content)})
 
     transcript_parts: list[str] = []
     for item in processed:
-        title = item["role"].replace("system", "System").replace("assistant", "Assistant").replace("user", "User")
+        title = (
+            item["role"]
+            .replace("system", "System")
+            .replace("assistant", "Assistant")
+            .replace("user", "User")
+            .replace("developer", "Developer")
+        )
         transcript_parts.append(f"{title}: {item['content']}".strip())
 
     if tools:
