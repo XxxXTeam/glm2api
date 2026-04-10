@@ -9,6 +9,7 @@ DEFAULT_ASSISTANT_ID = "65940acff94777010aa6b796"
 DEFAULT_IMAGE_ASSISTANT_ID = "65a232c082ff90a2ad2f15e2"
 DEFAULT_IMAGE_MODEL_NAME = "glm-image-1"
 DEFAULT_GLM_BASE_URL = "https://chatglm.cn/chatglm"
+GUEST_REFRESH_TOKEN_MARKER = "__glm_guest__"
 BUILTIN_EXPOSED_MODELS = (
     "cogView-4-250304",
     "glm-5.1",
@@ -87,6 +88,13 @@ def load_refresh_tokens(token_file_path: Path) -> list[str]:
     return tokens
 
 
+def is_guest_token_value(value: str | None) -> bool:
+    if value is None:
+        return False
+    normalized = value.strip().lower()
+    return normalized in {"guest", "guest_ck", "guest-ck", "visitor", "tourist", "游客", GUEST_REFRESH_TOKEN_MARKER}
+
+
 @dataclass(slots=True)
 class AppConfig:
     env_file_path: Path
@@ -97,6 +105,7 @@ class AppConfig:
     log_level: str
     request_timeout: int
     glm_base_url: str
+    glm_use_guest_refresh_token: bool
     glm_refresh_token: str
     glm_refresh_tokens: list[str]
     glm_assistant_id: str
@@ -108,6 +117,7 @@ class AppConfig:
     glm_queue_wait_timeout: int
     glm_busy_max_retries: int
     glm_busy_retry_interval: float
+    glm_guest_max_retries: int
     exposed_models: list[str]
     model_aliases: dict[str, str]
     server_api_keys: list[str]
@@ -116,6 +126,10 @@ class AppConfig:
     @property
     def refresh_url(self) -> str:
         return f"{self.glm_base_url}/user-api/user/refresh"
+
+    @property
+    def guest_refresh_url(self) -> str:
+        return f"{self.glm_base_url}/user-api/guest/access"
 
     @property
     def chat_stream_url(self) -> str:
@@ -135,8 +149,16 @@ def load_config(env_file: str = ".env") -> AppConfig:
         token_file_path = (env_path.parent / token_file_path).resolve()
     refresh_tokens = load_refresh_tokens(token_file_path)
     single_refresh_token = values.get("GLM_REFRESH_TOKEN", "").strip()
-    if not refresh_tokens and single_refresh_token:
+    explicit_guest_mode = parse_bool(values.get("GLM_USE_GUEST_REFRESH_TOKEN"), False) or is_guest_token_value(single_refresh_token)
+    if explicit_guest_mode:
+        refresh_tokens = [GUEST_REFRESH_TOKEN_MARKER]
+        single_refresh_token = GUEST_REFRESH_TOKEN_MARKER
+    elif not refresh_tokens and single_refresh_token:
         refresh_tokens = [single_refresh_token]
+    elif not refresh_tokens:
+        refresh_tokens = [GUEST_REFRESH_TOKEN_MARKER]
+        single_refresh_token = GUEST_REFRESH_TOKEN_MARKER
+        explicit_guest_mode = True
     image_model_name = DEFAULT_IMAGE_MODEL_NAME
     exposed_models = list(BUILTIN_EXPOSED_MODELS)
     model_aliases = dict(BUILTIN_MODEL_ALIASES)
@@ -150,6 +172,7 @@ def load_config(env_file: str = ".env") -> AppConfig:
         log_level=values.get("LOG_LEVEL", "INFO").upper(),
         request_timeout=parse_int(values.get("REQUEST_TIMEOUT_SECONDS"), 120),
         glm_base_url=values.get("GLM_BASE_URL", DEFAULT_GLM_BASE_URL).rstrip("/"),
+        glm_use_guest_refresh_token=explicit_guest_mode,
         glm_refresh_token=single_refresh_token,
         glm_refresh_tokens=refresh_tokens,
         glm_assistant_id=values.get("GLM_ASSISTANT_ID", DEFAULT_ASSISTANT_ID).strip(),
@@ -167,14 +190,10 @@ def load_config(env_file: str = ".env") -> AppConfig:
         glm_queue_wait_timeout=parse_int(values.get("GLM_QUEUE_WAIT_TIMEOUT_SECONDS"), 600),
         glm_busy_max_retries=parse_int(values.get("GLM_BUSY_MAX_RETRIES"), 30),
         glm_busy_retry_interval=parse_float(values.get("GLM_BUSY_RETRY_INTERVAL_SECONDS"), 2.0),
+        glm_guest_max_retries=max(0, parse_int(values.get("GLM_GUEST_MAX_RETRIES"), 3)),
         exposed_models=exposed_models, # type: ignore
         model_aliases=model_aliases,
         server_api_keys=parse_list(values.get("SERVER_API_KEYS")),
         cors_allow_origin=values.get("CORS_ALLOW_ORIGIN", "*").strip() or "*",
     )
-    if not config.glm_refresh_tokens:
-        raise ValueError(
-            "缺少可用账号 token：请在 token.txt 中每行填写一个 refresh_token，"
-            "或在 .env 中配置 GLM_REFRESH_TOKEN 作为兜底。"
-        )
     return config

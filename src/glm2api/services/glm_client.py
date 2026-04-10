@@ -721,15 +721,30 @@ class GLMWebClient:
 
         for offset in range(account_count):
             account_index = (start_index + offset) % account_count
-            try:
-                access_token = self.auth.get_access_token_for_account(account_index)
-                return operation(account_index, access_token)
-            except Exception as exc:
-                last_exc = exc
-                if not self.auth.should_switch_account(exc) or account_count == 1:
-                    raise
-                self.auth.invalidate_account(account_index)
-                self.auth.advance_account(account_index, f"{request_name}: {exc}")
+            guest_retry_limit = self.config.glm_guest_max_retries if self.auth.is_guest_account(account_index) else 0
+            for attempt in range(guest_retry_limit + 1):
+                try:
+                    access_token = self.auth.get_access_token_for_account(account_index)
+                    return operation(account_index, access_token)
+                except Exception as exc:
+                    last_exc = exc
+                    should_switch = self.auth.should_switch_account(exc)
+                    if should_switch:
+                        self.auth.invalidate_account(account_index)
+                    if should_switch and attempt < guest_retry_limit:
+                        self.logger.warning(
+                            "游客账号请求失败，重新获取游客 ck 重试 attempt=%s/%s request=%s account=%s error=%s",
+                            attempt + 1,
+                            guest_retry_limit,
+                            request_name,
+                            account_index,
+                            exc,
+                        )
+                        continue
+                    if not should_switch or account_count == 1:
+                        raise
+                    self.auth.advance_account(account_index, f"{request_name}: {exc}")
+                    break
 
         self.auth.reset_account_cycle()
         if last_exc is not None:

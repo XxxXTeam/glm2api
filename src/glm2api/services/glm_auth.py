@@ -12,7 +12,7 @@ import urllib.request
 from dataclasses import dataclass
 from logging import Logger
 
-from ..config import AppConfig
+from ..config import AppConfig, GUEST_REFRESH_TOKEN_MARKER
 
 
 SIGN_SECRET = "8a1317a7468aa3ad86e997d08f3f31cb"
@@ -39,6 +39,7 @@ class AccessToken:
 @dataclass(slots=True)
 class AccountState:
     refresh_token: str
+    is_guest: bool = False
     cached_token: AccessToken | None = None
 
 
@@ -46,15 +47,21 @@ class GLMAccessTokenManager:
     def __init__(self, config: AppConfig, logger: Logger) -> None:
         self.config = config
         self.logger = logger
-        self._accounts = [AccountState(refresh_token=token) for token in config.glm_refresh_tokens]
+        self._accounts = [
+            AccountState(
+                refresh_token="" if token == GUEST_REFRESH_TOKEN_MARKER else token,
+                is_guest=(token == GUEST_REFRESH_TOKEN_MARKER),
+            )
+            for token in config.glm_refresh_tokens
+        ]
         self._current_index = 0
         self._lock = threading.Lock()
         self._persist_lock = threading.Lock()
 
-    def get_browser_headers(self) -> dict[str, str]:
+    def get_browser_headers(self, app_fr: str = "browser_extension") -> dict[str, str]:
         return {
-            "Accept": "text/event-stream",
-            "Accept-Encoding": "identity",
+            "Accept": "application/json, text/plain, */*" if app_fr == "default" else "text/event-stream",
+            "Accept-Encoding": "gzip, deflate" if app_fr == "default" else "identity",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
             "App-Name": "chatglm",
             "Cache-Control": "no-cache",
@@ -69,7 +76,7 @@ class GLMAccessTokenManager:
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
             "User-Agent": self.config.glm_user_agent,
-            "X-App-Fr": "browser_extension",
+            "X-App-Fr": app_fr,
             "X-App-Platform": "pc",
             "X-App-Version": "0.0.1",
             "X-Device-Brand": "",
@@ -96,6 +103,10 @@ class GLMAccessTokenManager:
     def get_current_account_index(self) -> int:
         with self._lock:
             return self._current_index
+
+    def is_guest_account(self, account_index: int) -> bool:
+        with self._lock:
+            return self._accounts[account_index].is_guest
 
     def advance_account(self, failed_index: int, reason: str) -> int:
         with self._lock:
@@ -132,6 +143,8 @@ class GLMAccessTokenManager:
 
     def _refresh_access_token(self, account_index: int) -> AccessToken:
         account = self._accounts[account_index]
+        if account.is_guest or not account.refresh_token:
+            return self._fetch_guest_access_token(account_index)
         timestamp, nonce, sign = build_sign()
         request = urllib.request.Request(
             self.config.refresh_url,
@@ -168,8 +181,46 @@ class GLMAccessTokenManager:
             expires_at=time.time() + ACCESS_TOKEN_EXPIRES_SECONDS - random.randint(10, 30),
         )
 
+    def _fetch_guest_access_token(self, account_index: int) -> AccessToken:
+        account = self._accounts[account_index]
+        timestamp, nonce, sign = build_sign()
+        request_id = uuid.uuid4().hex
+        device_id = uuid.uuid4().hex
+        request = urllib.request.Request(
+            self.config.guest_refresh_url,
+            data=b"",
+            method="POST",
+            headers={
+                **self.get_browser_headers(app_fr="default"),
+                "Content-Length": "0",
+                "Referer": "https://chatglm.cn/",
+                "X-Device-Id": device_id,
+                "X-Nonce": nonce,
+                "X-Request-Id": request_id,
+                "X-Sign": sign,
+                "X-Timestamp": timestamp,
+            },
+        )
+        with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
+            payload = self.read_json_response(response)
+        code = payload.get("code", payload.get("status"))
+        result = payload.get("result") or {}
+        access_token = result.get("access_token")
+        refresh_token = result.get("refresh_token")
+        if response.status != 200 or code not in {0, None} or not access_token or not refresh_token:
+            raise RuntimeError(f"获取 GLM 游客 token 失败: {payload}")
+        account.refresh_token = str(refresh_token)
+        self.logger.info("已获取新的 GLM 游客 refresh_token index=%s", account_index)
+        return AccessToken(
+            access_token=str(access_token),
+            refresh_token=str(refresh_token),
+            expires_at=time.time() + ACCESS_TOKEN_EXPIRES_SECONDS - random.randint(10, 30),
+        )
+
     def _persist_refresh_token(self, account_index: int, refresh_token: str) -> None:
         with self._persist_lock:
+            if self._accounts[account_index].is_guest:
+                return
             if self.config.token_file_path.exists() or len(self.config.glm_refresh_tokens) > 1:
                 tokens = list(self.config.glm_refresh_tokens)
                 tokens[account_index] = refresh_token

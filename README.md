@@ -15,10 +15,10 @@
 
 - 你已经登录过 `https://chatglm.cn`
 > 其实不登陆也行,但是会有部分限制?
-- 你能获取到有效的 `refresh_token`
+- 你能获取到有效的 `refresh_token`，或者接受游客模式的能力限制
 - 本地已准备好 Python 虚拟环境
 
-## 2. 获取 GLM Refresh Token
+## 2. 获取 GLM Refresh Token / 游客模式
 
 获取方式：
 
@@ -34,6 +34,14 @@
 ```env
 GLM_REFRESH_TOKEN=你的_refresh_token
 ```
+
+如果你不想登录账号，也可以直接启用游客模式：
+
+```env
+GLM_USE_GUEST_REFRESH_TOKEN=true
+```
+
+如果既没有配置 `token.txt`，也没有配置 `GLM_REFRESH_TOKEN`，程序也会自动退回游客模式，并在请求失败时自动重新获取新的游客 `refresh_token` 后重试。
 
 ## 3. 配置文件
 
@@ -57,6 +65,13 @@ token-c
 GLM_REFRESH_TOKEN=你的_refresh_token
 ```
 
+如果你想显式固定走游客模式，可以这样写：
+
+```env
+GLM_USE_GUEST_REFRESH_TOKEN=true
+GLM_GUEST_MAX_RETRIES=3
+```
+
 常用配置说明：
 
 - `HOST`
@@ -77,6 +92,12 @@ GLM_REFRESH_TOKEN=你的_refresh_token
 - `GLM_IMAGE_ASSISTANT_ID`
   图片生成使用的 assistant id
 
+- `GLM_USE_GUEST_REFRESH_TOKEN`
+  显式启用游客 ck；开启后会忽略已配置的账号 token
+
+- `GLM_GUEST_MAX_RETRIES`
+  游客 ck 请求失败时，最多自动重新拉取游客 token 并重试多少次
+
 - `GLM_DELETE_CONVERSATION`
   是否在请求结束后自动删除 GLM 会话记录
 
@@ -89,10 +110,13 @@ GLM_REFRESH_TOKEN=你的_refresh_token
 说明：
 
 - 如果存在 `token.txt`，程序会优先从这里加载多账号
+- 如果显式设置了 `GLM_USE_GUEST_REFRESH_TOKEN=true`，程序会直接走游客模式
 - 当某个账号请求失败时，会自动切换到下一账号继续尝试
 - 如果本轮所有账号都失败，下一次会从第一个账号重新开始
 - 当上游返回新的 `refresh_token` 时，多账号模式会自动写回 `token.txt` 对应行
 - 单账号兜底模式下，程序仍会自动写回 `.env`
+- 游客模式下不会把临时游客 `refresh_token` 落盘到 `.env` 或 `token.txt`
+- 如果完全没有配置账号 token，程序会自动获取游客 `refresh_token` 作为兜底
 - 如果你的 `.env` 不存在，程序无法自动落盘新的 token
 - `/v1/models` 返回的模型列表已经固定写在代码中，不再通过配置文件自定义
 
@@ -280,7 +304,7 @@ LOG_LEVEL=DEBUG
 
 ### 11.1 启动时报 `GLM_REFRESH_TOKEN` 缺失
 
-说明 `.env` 中没有填写有效 token。
+新版本默认会自动退回游客模式；如果你仍想固定使用账号，请检查 `.env` 或 `token.txt` 里的 `refresh_token` 是否填写正确。
 
 ### 11.2 返回“请等待其他对话生成完毕”
 
