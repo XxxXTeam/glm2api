@@ -16,9 +16,14 @@ COLORS = {
 
 class ColorFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        color = COLORS.get(record.levelname, "")
-        record.levelname = f"{color}{record.levelname}{RESET}"
-        return super().format(record)
+        original_levelname = record.levelname
+        color = COLORS.get(original_levelname, "")
+        if color:
+            record.levelname = f"{color}{original_levelname}{RESET}"
+        try:
+            return super().format(record)
+        finally:
+            record.levelname = original_levelname
 
 
 def setup_logging(level: str) -> None:
@@ -31,7 +36,8 @@ def setup_logging(level: str) -> None:
     )
     root = logging.getLogger()
     root.handlers.clear()
-    root.setLevel(level)
+    resolved_level = getattr(logging, str(level).upper(), logging.INFO)
+    root.setLevel(resolved_level)
     root.addHandler(handler)
 
 

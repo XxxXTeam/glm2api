@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import traceback
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +18,8 @@ class GLM2APIServer:
         self.logger = logger
         handler_cls = self._build_handler()
         self._server = ThreadingHTTPServer((config.host, config.port), handler_cls)
+        self._server.daemon_threads = True
+        self._server.allow_reuse_address = True
 
     def serve_forever(self) -> None:
         self._server.serve_forever()
@@ -40,24 +43,35 @@ class GLM2APIServer:
                 self.end_headers()
 
             def do_GET(self) -> None:
-                if self.path == "/health":
-                    self._write_json(HTTPStatus.OK, {"status": "ok"})
-                    return
+                try:
+                    if self.path == "/health":
+                        self._write_json(HTTPStatus.OK, {"status": "ok"})
+                        return
 
-                if self.path == f"{config.api_prefix}/models":
-                    self._write_json(
-                        HTTPStatus.OK,
-                        {
-                            "object": "list",
-                            "data": [
-                                {"id": model, "object": "model", "owned_by": "glm2api"}
-                                for model in config.exposed_models
-                            ],
-                        },
+                    if self.path == f"{config.api_prefix}/models":
+                        self._write_json(
+                            HTTPStatus.OK,
+                            {
+                                "object": "list",
+                                "data": [
+                                    {"id": model, "object": "model", "owned_by": "glm2api"}
+                                    for model in config.exposed_models
+                                ],
+                            },
+                        )
+                        return
+
+                    self._write_json(HTTPStatus.NOT_FOUND, {"error": {"message": "Not Found"}})
+                except BrokenPipeError:
+                    logger.warning("客户端在 GET 响应写回前断开 path=%s", self.path)
+                except ConnectionResetError:
+                    logger.warning("客户端重置了 GET 连接 path=%s", self.path)
+                except Exception as exc:
+                    logger.error("处理 GET 请求失败 path=%s error=%s\n%s", self.path, exc, traceback.format_exc())
+                    self._safe_write_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"error": {"message": "服务内部错误", "type": exc.__class__.__name__}},
                     )
-                    return
-
-                self._write_json(HTTPStatus.NOT_FOUND, {"error": {"message": "Not Found"}})
 
             def do_POST(self) -> None:
                 try:
@@ -72,9 +86,40 @@ class GLM2APIServer:
                         self._write_json(HTTPStatus.UNAUTHORIZED, {"error": {"message": "Unauthorized"}})
                         return
 
-                    content_length = int(self.headers.get("Content-Length", "0"))
+                    content_length = self._parse_content_length()
+                    if content_length < 0:
+                        self._write_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": {"message": "Content-Length 不能为负数。", "type": "invalid_content_length"}},
+                        )
+                        return
                     raw_body = self.rfile.read(content_length) if content_length else b"{}"
-                    payload = json.loads(raw_body.decode("utf-8"))
+                    try:
+                        payload = json.loads(raw_body.decode("utf-8"))
+                    except UnicodeDecodeError:
+                        self._write_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": {"message": "请求体必须是 UTF-8 编码。", "type": "invalid_encoding"}},
+                        )
+                        return
+                    except json.JSONDecodeError as exc:
+                        self._write_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {
+                                "error": {
+                                    "message": f"请求体不是合法 JSON: {exc.msg}",
+                                    "type": "invalid_json",
+                                }
+                            },
+                        )
+                        return
+
+                    if not isinstance(payload, dict):
+                        self._write_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": {"message": "请求体顶层必须是 JSON 对象。", "type": "invalid_payload"}},
+                        )
+                        return
 
                     if self.path == f"{config.api_prefix}/images/generations":
                         if not payload.get("prompt"):
@@ -108,13 +153,22 @@ class GLM2APIServer:
                     )
                 except UpstreamAPIError as exc:
                     logger.warning("上游 GLM 返回错误 status=%s error=%s", exc.status_code, exc)
+                    status = self._safe_http_status(exc.status_code, fallback=HTTPStatus.BAD_GATEWAY)
                     self._write_json(
-                        HTTPStatus(exc.status_code),
+                        status,
                         {"error": {"message": str(exc), "type": "upstream_error", "details": exc.payload}},
                     )
+                except ValueError as exc:
+                    logger.warning("请求参数错误 path=%s error=%s", self.path, exc)
+                    self._write_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": {"message": str(exc), "type": "invalid_request"}},
+                    )
+                except (BrokenPipeError, ConnectionResetError, socket.timeout) as exc:
+                    logger.warning("客户端连接提前断开 path=%s error=%s", self.path, exc)
                 except Exception as exc:
                     logger.error("处理请求失败 error=%s\n%s", exc, traceback.format_exc())
-                    self._write_json(
+                    self._safe_write_json(
                         HTTPStatus.BAD_GATEWAY,
                         {"error": {"message": str(exc), "type": exc.__class__.__name__}},
                     )
@@ -129,16 +183,29 @@ class GLM2APIServer:
                 self.end_headers()
 
                 sent_done = False
-                for chunk in stream_iter:
-                    if chunk:
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                        if b"data: [DONE]\n\n" in chunk:
-                            sent_done = True
-
-                if not sent_done:
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    self.wfile.flush()
+                try:
+                    for chunk in stream_iter:
+                        if chunk:
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                            if b"data: [DONE]\n\n" in chunk:
+                                sent_done = True
+                except UpstreamAPIError as exc:
+                    logger.warning("流式请求中途收到上游错误 status=%s error=%s", exc.status_code, exc)
+                    self._write_sse_error(str(exc), "upstream_error")
+                except (BrokenPipeError, ConnectionResetError, socket.timeout) as exc:
+                    logger.warning("客户端在流式响应过程中断开 model=%s error=%s", payload.get("model"), exc)
+                    return
+                except Exception as exc:
+                    logger.error("流式请求失败 model=%s error=%s\n%s", payload.get("model"), exc, traceback.format_exc())
+                    self._write_sse_error(str(exc), exc.__class__.__name__)
+                finally:
+                    if not sent_done:
+                        try:
+                            self.wfile.write(b"data: [DONE]\n\n")
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                            pass
                 logger.info("流式请求完成 model=%s", payload.get("model"))
 
             def _authorize(self) -> bool:
@@ -163,6 +230,39 @@ class GLM2APIServer:
                 self.send_header("Access-Control-Allow-Origin", config.cors_allow_origin)
                 self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+            def _safe_write_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
+                try:
+                    self._write_json(status, payload)
+                except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                    logger.warning("客户端在 JSON 响应写回前断开 path=%s", self.path)
+
+            def _parse_content_length(self) -> int:
+                raw_value = self.headers.get("Content-Length", "0").strip()
+                try:
+                    return int(raw_value or "0")
+                except ValueError as exc:
+                    raise ValueError(f"无效的 Content-Length: {raw_value}") from exc
+
+            def _write_sse_error(self, message: str, error_type: str) -> None:
+                event = {
+                    "error": {
+                        "message": message,
+                        "type": error_type,
+                    }
+                }
+                try:
+                    payload = f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8")
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                    logger.warning("客户端在 SSE 错误写回前断开 path=%s", self.path)
+
+            def _safe_http_status(self, value: int, fallback: HTTPStatus) -> HTTPStatus:
+                try:
+                    return HTTPStatus(value)
+                except ValueError:
+                    return fallback
 
             def log_message(self, format: str, *args) -> None:
                 logger.info("%s - %s", self.address_string(), format % args)

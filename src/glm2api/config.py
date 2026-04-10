@@ -35,12 +35,23 @@ BUILTIN_EXPOSED_MODELS = (
 BUILTIN_MODEL_ALIASES = {name: name for name in BUILTIN_EXPOSED_MODELS}
 
 
+class ConfigError(ValueError):
+    pass
+
+
 def parse_dotenv(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
         return values
 
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"配置文件不是有效的 UTF-8 编码: {path}") from exc
+    except OSError as exc:
+        raise ConfigError(f"读取配置文件失败: {path} error={exc}") from exc
+
+    for raw_line in lines:
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -61,13 +72,19 @@ def parse_bool(value: str | None, default: bool = False) -> bool:
 def parse_int(value: str | None, default: int) -> int:
     if value is None or value == "":
         return default
-    return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"整数配置值无效: {value}") from exc
 
 
 def parse_float(value: str | None, default: float) -> float:
     if value is None or value == "":
         return default
-    return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"浮点配置值无效: {value}") from exc
 
 
 def parse_list(value: str | None, default: tuple[str, ...] = ()) -> list[str]:
@@ -80,7 +97,13 @@ def load_refresh_tokens(token_file_path: Path) -> list[str]:
     if not token_file_path.exists():
         return []
     tokens: list[str] = []
-    for raw_line in token_file_path.read_text(encoding="utf-8").splitlines():
+    try:
+        lines = token_file_path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"token 文件不是有效的 UTF-8 编码: {token_file_path}") from exc
+    except OSError as exc:
+        raise ConfigError(f"读取 token 文件失败: {token_file_path} error={exc}") from exc
+    for raw_line in lines:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -159,6 +182,16 @@ def load_config(env_file: str = ".env") -> AppConfig:
         refresh_tokens = [GUEST_REFRESH_TOKEN_MARKER]
         single_refresh_token = GUEST_REFRESH_TOKEN_MARKER
         explicit_guest_mode = True
+    host = values.get("HOST", "127.0.0.1").strip() or "127.0.0.1"
+    api_prefix = values.get("API_PREFIX", "/v1").strip()
+    if not api_prefix:
+        api_prefix = "/v1"
+    if not api_prefix.startswith("/"):
+        api_prefix = f"/{api_prefix}"
+    api_prefix = api_prefix.rstrip("/") or "/v1"
+    log_level = values.get("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+        log_level = "INFO"
     image_model_name = DEFAULT_IMAGE_MODEL_NAME
     exposed_models = list(BUILTIN_EXPOSED_MODELS)
     model_aliases = dict(BUILTIN_MODEL_ALIASES)
@@ -166,10 +199,10 @@ def load_config(env_file: str = ".env") -> AppConfig:
     config = AppConfig(
         env_file_path=env_path,
         token_file_path=token_file_path,
-        host=values.get("HOST", "127.0.0.1"),
+        host=host,
         port=parse_int(values.get("PORT"), 8000),
-        api_prefix=values.get("API_PREFIX", "/v1").rstrip("/") or "/v1",
-        log_level=values.get("LOG_LEVEL", "INFO").upper(),
+        api_prefix=api_prefix,
+        log_level=log_level,
         request_timeout=parse_int(values.get("REQUEST_TIMEOUT_SECONDS"), 120),
         glm_base_url=values.get("GLM_BASE_URL", DEFAULT_GLM_BASE_URL).rstrip("/"),
         glm_use_guest_refresh_token=explicit_guest_mode,
@@ -196,4 +229,14 @@ def load_config(env_file: str = ".env") -> AppConfig:
         server_api_keys=parse_list(values.get("SERVER_API_KEYS")),
         cors_allow_origin=values.get("CORS_ALLOW_ORIGIN", "*").strip() or "*",
     )
+    if not (1 <= config.port <= 65535):
+        raise ConfigError(f"端口配置超出范围: PORT={config.port}")
+    if config.request_timeout <= 0:
+        raise ConfigError(f"请求超时必须大于 0: REQUEST_TIMEOUT_SECONDS={config.request_timeout}")
+    if config.glm_queue_wait_timeout <= 0:
+        raise ConfigError(f"队列等待时间必须大于 0: GLM_QUEUE_WAIT_TIMEOUT_SECONDS={config.glm_queue_wait_timeout}")
+    if config.glm_busy_retry_interval < 0:
+        raise ConfigError(f"忙碌重试间隔不能小于 0: GLM_BUSY_RETRY_INTERVAL_SECONDS={config.glm_busy_retry_interval}")
+    if not config.glm_base_url.startswith(("http://", "https://")):
+        raise ConfigError(f"GLM_BASE_URL 必须以 http:// 或 https:// 开头: {config.glm_base_url}")
     return config

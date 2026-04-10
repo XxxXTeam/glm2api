@@ -532,9 +532,12 @@ class GLMWebClient:
         return max(1, min(parsed, maximum))
 
     def _download_image_as_base64(self, image_url: str) -> str:
-        with urllib.request.urlopen(image_url, timeout=self.config.request_timeout) as response:
-            image_bytes = response.read()
-        return base64.b64encode(image_bytes).decode("ascii")
+        try:
+            with urllib.request.urlopen(image_url, timeout=self.config.request_timeout) as response:
+                image_bytes = response.read()
+            return base64.b64encode(image_bytes).decode("ascii")
+        except Exception as exc:
+            raise UpstreamAPIError(status_code=502, message=f"下载图片失败: {image_url} error={exc}") from exc
 
     def _iter_sse_events(self, response):
         pending = ""
@@ -679,13 +682,16 @@ class GLMWebClient:
         return response
 
     def _read_error_payload(self, error: urllib.error.HTTPError) -> dict[str, object]:
-        raw_body = error.read()
-        content_encoding = error.headers.get("Content-Encoding", "").lower()
+        try:
+            raw_body = error.read()
+            content_encoding = error.headers.get("Content-Encoding", "").lower()
 
-        if content_encoding == "gzip":
-            raw_body = gzip.decompress(raw_body)
+            if content_encoding == "gzip":
+                raw_body = gzip.decompress(raw_body)
 
-        text = raw_body.decode("utf-8", errors="ignore")
+            text = raw_body.decode("utf-8", errors="ignore")
+        except Exception as exc:
+            return {"message": f"读取上游错误响应失败: {exc}"}
         try:
             payload = json.loads(text)
             if isinstance(payload, dict):
@@ -716,6 +722,8 @@ class GLMWebClient:
 
     def _call_with_account_failover(self, request_name: str, operation: Callable[[int, str], object]):
         account_count = self.auth.get_account_count()
+        if account_count <= 0:
+            raise RuntimeError("没有可用的 GLM 账号或游客 token 配置")
         start_index = self.auth.get_current_account_index()
         last_exc: Exception | None = None
 

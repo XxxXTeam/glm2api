@@ -85,13 +85,23 @@ class GLMAccessTokenManager:
         }
 
     def read_json_response(self, response) -> dict[str, object]:
-        raw_body = response.read()
-        content_encoding = response.headers.get("Content-Encoding", "").lower()
+        try:
+            raw_body = response.read()
+            content_encoding = response.headers.get("Content-Encoding", "").lower()
 
-        if content_encoding == "gzip":
-            raw_body = gzip.decompress(raw_body)
+            if content_encoding == "gzip":
+                raw_body = gzip.decompress(raw_body)
 
-        return json.loads(raw_body.decode("utf-8"))
+            payload = json.loads(raw_body.decode("utf-8"))
+        except gzip.BadGzipFile as exc:
+            raise RuntimeError("GLM 响应 gzip 解压失败") from exc
+        except UnicodeDecodeError as exc:
+            raise RuntimeError("GLM 响应不是合法 UTF-8") from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"GLM 响应不是合法 JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"GLM 响应格式异常，期望 JSON 对象，实际是: {type(payload).__name__}")
+        return payload
 
     def get_access_token(self) -> str:
         with self._lock:
@@ -169,7 +179,10 @@ class GLMAccessTokenManager:
         if response.status != 200 or code not in {0, None} or not access_token:
             raise RuntimeError(f"刷新 GLM token 失败: {payload}")
         if refresh_token != account.refresh_token:
-            self._persist_refresh_token(account_index, refresh_token)
+            try:
+                self._persist_refresh_token(account_index, refresh_token)
+            except Exception as exc:
+                self.logger.warning("写回 GLM refresh_token 失败 index=%s error=%s", account_index, exc)
             account.refresh_token = refresh_token
             self.config.glm_refresh_tokens[account_index] = refresh_token
             if account_index == 0:
@@ -225,7 +238,10 @@ class GLMAccessTokenManager:
                 tokens = list(self.config.glm_refresh_tokens)
                 tokens[account_index] = refresh_token
                 content = "\n".join(tokens) + "\n"
-                self.config.token_file_path.write_text(content, encoding="utf-8")
+                try:
+                    self.config.token_file_path.write_text(content, encoding="utf-8")
+                except OSError as exc:
+                    raise RuntimeError(f"写入 token 文件失败: {self.config.token_file_path} error={exc}") from exc
                 return
             self._persist_env_refresh_token(refresh_token)
 
@@ -235,7 +251,12 @@ class GLMAccessTokenManager:
             self.logger.warning(".env 文件不存在，无法自动写回新的 refresh_token")
             return
 
-        content = env_path.read_text(encoding="utf-8")
+        try:
+            content = env_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(f".env 不是有效的 UTF-8 编码: {env_path}") from exc
+        except OSError as exc:
+            raise RuntimeError(f"读取 .env 失败: {env_path} error={exc}") from exc
         lines = content.splitlines()
         updated = False
 
@@ -251,7 +272,10 @@ class GLMAccessTokenManager:
             lines.append(f"GLM_REFRESH_TOKEN={refresh_token}")
 
         new_content = "\n".join(lines) + "\n"
-        env_path.write_text(new_content, encoding="utf-8")
+        try:
+            env_path.write_text(new_content, encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(f"写入 .env 失败: {env_path} error={exc}") from exc
 
     def should_switch_account(self, exc: Exception) -> bool:
         if hasattr(exc, "status_code"):
