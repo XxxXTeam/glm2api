@@ -34,13 +34,16 @@ class Application:
         self._install_signal_handlers()
 
     def run(self) -> None:
+        if self.config.env_file_created:
+            self.logger.info("未检测到配置文件，已自动从默认示例复制: %s", self.config.env_file_path)
         self.logger.info(
-            "启动服务 host=%s port=%s prefix=%s concurrency=%s accounts=%s models=%s",
+            "启动服务 host=%s port=%s prefix=%s concurrency=%s accounts=%s debug_dump_all=%s models=%s",
             self.config.host,
             self.config.port,
             self.config.api_prefix,
             self.config.glm_max_concurrency,
             len(self.config.glm_refresh_tokens),
+            self.config.debug_dump_all,
             ",".join(self.config.exposed_models),
         )
         try:

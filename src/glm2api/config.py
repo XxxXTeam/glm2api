@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -121,11 +122,13 @@ def is_guest_token_value(value: str | None) -> bool:
 @dataclass(slots=True)
 class AppConfig:
     env_file_path: Path
+    env_file_created: bool
     token_file_path: Path
     host: str
     port: int
     api_prefix: str
     log_level: str
+    debug_dump_all: bool
     request_timeout: int
     glm_base_url: str
     glm_use_guest_refresh_token: bool
@@ -163,8 +166,29 @@ class AppConfig:
         return f"{self.glm_base_url}/backend-api/assistant/conversation/delete"
 
 
+def ensure_env_file(env_path: Path) -> bool:
+    if env_path.exists():
+        return False
+
+    example_candidates = [
+        env_path.with_name(".env.example"),
+        env_path.parent / ".env.example",
+    ]
+    example_path = next((candidate for candidate in example_candidates if candidate.exists()), None)
+    if example_path is None:
+        return False
+
+    try:
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(example_path, env_path)
+    except OSError as exc:
+        raise ConfigError(f"自动创建配置文件失败: source={example_path} target={env_path} error={exc}") from exc
+    return True
+
+
 def load_config(env_file: str = ".env") -> AppConfig:
     env_path = Path(env_file)
+    env_file_created = ensure_env_file(env_path)
     file_values = parse_dotenv(env_path)
     values = {**file_values, **os.environ}
     token_file_path = Path(values.get("GLM_TOKEN_FILE", "token.txt"))
@@ -190,6 +214,9 @@ def load_config(env_file: str = ".env") -> AppConfig:
         api_prefix = f"/{api_prefix}"
     api_prefix = api_prefix.rstrip("/") or "/v1"
     log_level = values.get("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    debug_dump_all = parse_bool(values.get("DEBUG_DUMP_ALL"), False)
+    if debug_dump_all:
+        log_level = "DEBUG"
     if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         log_level = "INFO"
     image_model_name = DEFAULT_IMAGE_MODEL_NAME
@@ -198,11 +225,13 @@ def load_config(env_file: str = ".env") -> AppConfig:
 
     config = AppConfig(
         env_file_path=env_path,
+        env_file_created=env_file_created,
         token_file_path=token_file_path,
         host=host,
         port=parse_int(values.get("PORT"), 8000),
         api_prefix=api_prefix,
         log_level=log_level,
+        debug_dump_all=debug_dump_all,
         request_timeout=parse_int(values.get("REQUEST_TIMEOUT_SECONDS"), 120),
         glm_base_url=values.get("GLM_BASE_URL", DEFAULT_GLM_BASE_URL).rstrip("/"),
         glm_use_guest_refresh_token=explicit_guest_mode,

@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging import Logger
 
 from .config import AppConfig
+from .logging_utils import debug_dump
 from .services.glm_client import GLMWebClient, QueueTimeoutError, UpstreamAPIError
 
 
@@ -44,6 +45,7 @@ class GLM2APIServer:
 
             def do_GET(self) -> None:
                 try:
+                    self._debug_log_request_start()
                     if self.path == "/health":
                         self._write_json(HTTPStatus.OK, {"status": "ok"})
                         return
@@ -75,6 +77,7 @@ class GLM2APIServer:
 
             def do_POST(self) -> None:
                 try:
+                    self._debug_log_request_start()
                     if self.path not in {
                         f"{config.api_prefix}/chat/completions",
                         f"{config.api_prefix}/images/generations",
@@ -94,6 +97,7 @@ class GLM2APIServer:
                         )
                         return
                     raw_body = self.rfile.read(content_length) if content_length else b"{}"
+                    debug_dump(logger, config.debug_dump_all, f"HTTP 入站原始请求体 path={self.path}", raw_body)
                     try:
                         payload = json.loads(raw_body.decode("utf-8"))
                     except UnicodeDecodeError:
@@ -120,6 +124,7 @@ class GLM2APIServer:
                             {"error": {"message": "请求体顶层必须是 JSON 对象。", "type": "invalid_payload"}},
                         )
                         return
+                    debug_dump(logger, config.debug_dump_all, f"HTTP 入站解析后 JSON path={self.path}", payload)
 
                     if self.path == f"{config.api_prefix}/images/generations":
                         if not payload.get("prompt"):
@@ -186,6 +191,7 @@ class GLM2APIServer:
                 try:
                     for chunk in stream_iter:
                         if chunk:
+                            debug_dump(logger, config.debug_dump_all, f"HTTP 出站流式分片 model={payload.get('model')}", chunk)
                             self.wfile.write(chunk)
                             self.wfile.flush()
                             if b"data: [DONE]\n\n" in chunk:
@@ -219,6 +225,7 @@ class GLM2APIServer:
 
             def _write_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
                 body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                debug_dump(logger, config.debug_dump_all, f"HTTP 出站 JSON 响应 status={int(status)} path={self.path}", body)
                 self.send_response(status)
                 self._send_common_headers()
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -263,6 +270,14 @@ class GLM2APIServer:
                     return HTTPStatus(value)
                 except ValueError:
                     return fallback
+
+            def _debug_log_request_start(self) -> None:
+                debug_dump(
+                    logger,
+                    config.debug_dump_all,
+                    f"HTTP 入站请求 {self.command} {self.path} headers",
+                    {key: value for key, value in self.headers.items()},
+                )
 
             def log_message(self, format: str, *args) -> None:
                 logger.info("%s - %s", self.address_string(), format % args)

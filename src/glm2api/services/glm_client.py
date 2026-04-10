@@ -19,6 +19,7 @@ from logging import Logger
 from typing import Callable
 
 from ..config import AppConfig
+from ..logging_utils import debug_dump
 from .glm_auth import GLMAccessTokenManager, build_sign
 from .translator import GLMEventAccumulator, convert_messages, resolve_chat_mode, resolve_upstream_model
 
@@ -124,7 +125,11 @@ class GLMWebClient:
         except Exception:
             lease.release()
             raise
-        accumulator = GLMEventAccumulator(model=str(payload["model"]))
+        accumulator = GLMEventAccumulator(
+            model=str(payload["model"]),
+            debug_enabled=self.config.debug_dump_all,
+            logger=self.logger,
+        )
         try:
             for event in self._iter_sse_events(response):
                 if not event:
@@ -147,7 +152,11 @@ class GLMWebClient:
             lease.release()
             raise
 
-        accumulator = GLMEventAccumulator(model=str(payload.get("model", self.config.glm_image_model_name)))
+        accumulator = GLMEventAccumulator(
+            model=str(payload.get("model", self.config.glm_image_model_name)),
+            debug_enabled=self.config.debug_dump_all,
+            logger=self.logger,
+        )
         try:
             for event in self._iter_sse_events(response):
                 if not event:
@@ -171,7 +180,11 @@ class GLMWebClient:
             lease.release()
             raise
 
-        accumulator = GLMEventAccumulator(model=str(payload["model"]))
+        accumulator = GLMEventAccumulator(
+            model=str(payload["model"]),
+            debug_enabled=self.config.debug_dump_all,
+            logger=self.logger,
+        )
 
         def generate():
             try:
@@ -264,9 +277,12 @@ class GLMWebClient:
             messages=list(openai_payload.get("messages", [])), # type: ignore
             tools=list(openai_payload.get("tools", [])) if isinstance(openai_payload.get("tools"), list) else None, # type: ignore
         )
+        debug_dump(self.logger, self.config.debug_dump_all, "OpenAI 原始 chat 请求 payload", openai_payload)
+        debug_dump(self.logger, self.config.debug_dump_all, "转换后的 GLM messages", converted_messages)
         refs = self._upload_referenced_files(list(openai_payload.get("messages", []))) # type: ignore
         if refs:
             converted_messages[0]["content"] = refs + list(converted_messages[0]["content"]) # type: ignore
+            debug_dump(self.logger, self.config.debug_dump_all, "附加上传引用后的 GLM messages", converted_messages)
 
         chat_mode = resolve_chat_mode(
             model=upstream_model,
@@ -304,6 +320,7 @@ class GLMWebClient:
             upstream_model,
             openai_payload.get("stream"),
         )
+        debug_dump(self.logger, self.config.debug_dump_all, "转发到 GLM 的 chat 原始请求体", request_body)
 
         def send_request(account_index: int, access_token: str):
             for attempt in range(self.config.glm_busy_max_retries + 1):
@@ -322,6 +339,12 @@ class GLMWebClient:
                             "X-Sign": sign,
                             "X-Timestamp": timestamp,
                         },
+                    )
+                    debug_dump(
+                        self.logger,
+                        self.config.debug_dump_all,
+                        f"转发到 GLM 的 chat 请求头 account={account_index} attempt={attempt + 1}",
+                        dict(request.header_items()),
                     )
                     return self._prepare_chat_response(
                         urllib.request.urlopen(request, timeout=self.config.request_timeout)
@@ -397,6 +420,8 @@ class GLMWebClient:
             size,
             payload.get("n", 1),
         )
+        debug_dump(self.logger, self.config.debug_dump_all, "OpenAI 原始 image 请求 payload", payload)
+        debug_dump(self.logger, self.config.debug_dump_all, "转发到 GLM 的 image 原始请求体", request_body)
 
         def send_request(account_index: int, access_token: str):
             timestamp, nonce, sign = build_sign()
@@ -414,6 +439,12 @@ class GLMWebClient:
                     "X-Timestamp": timestamp,
                 },
             )
+            debug_dump(
+                self.logger,
+                self.config.debug_dump_all,
+                f"转发到 GLM 的 image 请求头 account={account_index}",
+                dict(request.header_items()),
+            )
             try:
                 return self._prepare_chat_response(urllib.request.urlopen(request, timeout=self.config.request_timeout))
             except urllib.error.HTTPError as exc:
@@ -428,6 +459,7 @@ class GLMWebClient:
         content_type = response.headers.get("Content-Type", "").lower()
         if "application/json" in content_type:
             payload = self.auth.read_json_response(response)
+            debug_dump(self.logger, self.config.debug_dump_all, "GLM 非流式原始 JSON 响应", payload)
             status = payload.get("status")
             message = str(payload.get("message", "")).strip()
             if status not in (0, None) or message:
@@ -547,10 +579,13 @@ class GLMWebClient:
             if not lines:
                 return None
             payload = "\n".join(line[5:].strip() for line in lines)
+            debug_dump(self.logger, self.config.debug_dump_all, "GLM 原始 SSE block", block)
             if payload == "[DONE]":
                 return "[DONE]"
             try:
-                return json.loads(payload)
+                parsed = json.loads(payload)
+                debug_dump(self.logger, self.config.debug_dump_all, "GLM 解析后的 SSE payload", parsed)
+                return parsed
             except json.JSONDecodeError:
                 self.logger.debug("忽略无法解析的 SSE 片段: %s", payload)
                 return None
@@ -614,6 +649,12 @@ class GLMWebClient:
             boundary = _make_boundary()
             body = self._build_multipart(boundary, filename, mime_type, payload)
             upload_url = f"{self.config.glm_base_url}{FILE_UPLOAD_URL_SUFFIX}"
+            debug_dump(
+                self.logger,
+                self.config.debug_dump_all,
+                f"准备上传附件 url={file_url} filename={filename} mime={mime_type}",
+                {"filename": filename, "mime_type": mime_type, "bytes": len(payload)},
+            )
 
             def send_request(account_index: int, access_token: str):
                 timestamp, nonce, sign = build_sign()
@@ -633,10 +674,23 @@ class GLMWebClient:
                         "X-Timestamp": timestamp,
                     },
                 )
+                debug_dump(
+                    self.logger,
+                    self.config.debug_dump_all,
+                    f"转发到 GLM 的 file_upload 请求头 account={account_index}",
+                    dict(request.header_items()),
+                )
+                debug_dump(
+                    self.logger,
+                    self.config.debug_dump_all,
+                    f"转发到 GLM 的 file_upload 原始请求体 account={account_index}",
+                    body,
+                )
                 return urllib.request.urlopen(request, timeout=self.config.request_timeout)
 
             with self._call_with_account_failover("file_upload", send_request) as response: # type: ignore
                 result = self.auth.read_json_response(response).get("result", {})
+            debug_dump(self.logger, self.config.debug_dump_all, "GLM 文件上传响应 result", result)
             source_id = result.get("source_id") # type: ignore
             file_result_url = result.get("file_url", file_url) # type: ignore
             if not source_id:

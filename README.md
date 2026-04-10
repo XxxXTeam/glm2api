@@ -51,6 +51,8 @@ GLM_USE_GUEST_REFRESH_TOKEN=true
 cp .env.example .env
 ```
 
+如果当前目录没有 `.env`，程序启动时也会自动从 `.env.example` 复制一份默认配置再继续加载。
+
 推荐优先准备 `token.txt`，每行一个账号的 `refresh_token`：
 
 ```text
@@ -82,6 +84,9 @@ GLM_GUEST_MAX_RETRIES=3
 
 - `API_PREFIX`
   OpenAI 兼容路径前缀，默认 `/v1`
+
+- `DEBUG_DUMP_ALL`
+  调试狂暴模式。开启后会自动切到 `DEBUG`，并打印入站原始请求、转发给 GLM 的原始 body、上游原始响应和 SSE 分片、工具调用转换结果等几乎所有调试信息
 
 - `GLM_ASSISTANT_ID`
   普通对话使用的 assistant id

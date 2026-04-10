@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
+from bisect import insort
 from dataclasses import dataclass, field
+from logging import Logger
 
 from ..config import AppConfig
+from ..logging_utils import debug_dump
 from ..utils.tool_parser import StreamingToolParser, parse_tool_calls_from_text
 
 
@@ -158,23 +162,34 @@ def safe_json_dumps(payload: object) -> str:
 @dataclass
 class GLMEventAccumulator:
     model: str
+    debug_enabled: bool = False
+    logger: Logger | None = None
     conversation_id: str = ""
     created: int = field(default_factory=lambda: int(time.time()))
     parts_by_logic_id: dict[str, dict[str, object]] = field(default_factory=dict)
+    ordered_logic_ids: list[str] = field(default_factory=list)
     last_full_text: str = ""
     last_full_reasoning: str = ""
     visible_text_sent: int = 0
     visible_reasoning_sent: int = 0
     tool_parser: StreamingToolParser = field(default_factory=StreamingToolParser)
     emitted_role: bool = False
+    _render_cache_dirty: bool = True
+    _cached_full_text: str = ""
+    _cached_full_reasoning: str = ""
 
     def consume_event(self, payload: dict[str, object]) -> tuple[list[str], str | None]:
+        debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM SSE 解析事件", payload)
         if not self.conversation_id and payload.get("conversation_id"):
             self.conversation_id = str(payload["conversation_id"])
 
         for part in payload.get("parts", []) if isinstance(payload.get("parts"), list) else []: # pyright: ignore[reportGeneralTypeIssues]
             if isinstance(part, dict) and part.get("logic_id"):
-                self.parts_by_logic_id[str(part["logic_id"])] = part
+                logic_id = str(part["logic_id"])
+                if logic_id not in self.parts_by_logic_id:
+                    insort(self.ordered_logic_ids, logic_id)
+                self.parts_by_logic_id[logic_id] = part
+                self._render_cache_dirty = True
 
         full_text, full_reasoning = self._render_full_output()
         self.last_full_text = full_text
@@ -219,6 +234,7 @@ class GLMEventAccumulator:
                     }
                 )
             )
+        debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM SSE 生成增量块", chunks)
         return chunks, str(payload.get("status")) if payload.get("status") is not None else None
 
     def finalize(self, status: str | None, last_error: dict[str, object] | None = None) -> list[str]:
@@ -299,6 +315,7 @@ class GLMEventAccumulator:
             )
         )
         chunks.append("data: [DONE]\n\n")
+        debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM SSE finalize 输出", chunks)
         return chunks
 
     def build_response(self) -> dict[str, object]:
@@ -319,7 +336,7 @@ class GLMEventAccumulator:
                 {"id": item["id"], "type": "function", "function": item["function"]}
                 for item in tool_calls
             ]
-        return {
+        response = {
             "id": self.conversation_id,
             "object": "chat.completion",
             "created": self.created,
@@ -333,14 +350,19 @@ class GLMEventAccumulator:
             ],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         }
+        debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM 非流式最终响应", response)
+        return response
 
     def _render_full_output(self) -> tuple[str, str]:
-        ordered_parts = list(self.parts_by_logic_id.values())
-        ordered_parts.sort(key=lambda item: str(item.get("logic_id", "")))
+        if not self._render_cache_dirty:
+            return self._cached_full_text, self._cached_full_reasoning
 
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
-        for part in ordered_parts:
+        for logic_id in self.ordered_logic_ids:
+            part = self.parts_by_logic_id.get(logic_id)
+            if not isinstance(part, dict):
+                continue
             content_items = part.get("content", [])
             if not isinstance(content_items, list):
                 continue
@@ -373,7 +395,10 @@ class GLMEventAccumulator:
             if rendered_reasoning:
                 reasoning_parts.append(rendered_reasoning)
 
-        return "\n".join(text_parts), "\n".join(reasoning_parts)
+        self._cached_full_text = "\n".join(text_parts)
+        self._cached_full_reasoning = "\n".join(reasoning_parts)
+        self._render_cache_dirty = False
+        return self._cached_full_text, self._cached_full_reasoning
 
     def _chunk_json(self, patch: dict[str, object]) -> str:
         payload = {

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from logging import Logger
 
 from ..config import AppConfig, GUEST_REFRESH_TOKEN_MARKER
+from ..logging_utils import debug_dump
 
 
 SIGN_SECRET = "8a1317a7468aa3ad86e997d08f3f31cb"
@@ -92,6 +93,7 @@ class GLMAccessTokenManager:
             if content_encoding == "gzip":
                 raw_body = gzip.decompress(raw_body)
 
+            debug_dump(self.logger, self.config.debug_dump_all, "GLM 原始 JSON 响应体", raw_body)
             payload = json.loads(raw_body.decode("utf-8"))
         except gzip.BadGzipFile as exc:
             raise RuntimeError("GLM 响应 gzip 解压失败") from exc
@@ -170,6 +172,8 @@ class GLMAccessTokenManager:
                 "X-Timestamp": timestamp,
             },
         )
+        debug_dump(self.logger, self.config.debug_dump_all, f"GLM 刷新 access_token 请求头 account={account_index}", dict(request.header_items()))
+        debug_dump(self.logger, self.config.debug_dump_all, f"GLM 刷新 access_token 请求体 account={account_index}", b"{}")
         with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
             payload = self.read_json_response(response)
         code = payload.get("code", payload.get("status"))
@@ -214,6 +218,8 @@ class GLMAccessTokenManager:
                 "X-Timestamp": timestamp,
             },
         )
+        debug_dump(self.logger, self.config.debug_dump_all, f"GLM 游客 token 请求头 account={account_index}", dict(request.header_items()))
+        debug_dump(self.logger, self.config.debug_dump_all, f"GLM 游客 token 请求体 account={account_index}", b"")
         with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
             payload = self.read_json_response(response)
         code = payload.get("code", payload.get("status"))
