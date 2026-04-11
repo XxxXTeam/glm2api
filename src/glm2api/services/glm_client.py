@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import gzip
 import http.client
 import json
@@ -581,6 +582,7 @@ class GLMWebClient:
 
     def _iter_sse_events(self, response):
         pending = ""
+        decoder = codecs.getincrementaldecoder("utf-8")("ignore")
 
         def emit_block(block: str):
             lines = [line for line in block.split("\n") if line.startswith("data:")]
@@ -609,7 +611,7 @@ class GLMWebClient:
             if not raw_chunk:
                 break
 
-            pending += raw_chunk.decode("utf-8", errors="ignore").replace("\r\n", "\n")
+            pending += decoder.decode(raw_chunk, False).replace("\r\n", "\n")
 
             while "\n\n" in pending:
                 block, pending = pending.split("\n\n", 1)
@@ -621,6 +623,10 @@ class GLMWebClient:
 
             if stop_after_chunk:
                 break
+
+        remaining = decoder.decode(b"", True)
+        if remaining:
+            pending += remaining
 
         if pending.strip():
             event = emit_block(pending.strip())
