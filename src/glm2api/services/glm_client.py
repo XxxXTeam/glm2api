@@ -121,7 +121,7 @@ class GLMWebClient:
     def chat_completion(self, payload: dict[str, object]) -> tuple[dict[str, object], str | None]:
         lease = self.request_queue.acquire(f"chat:{payload.get('model', 'unknown')}")
         try:
-            response, assistant_id = self._open_chat_stream(payload)
+            response, assistant_id = self._open_chat_stream(payload, preferred_account_index=self._get_preferred_account_index(lease.ticket))
         except Exception:
             lease.release()
             raise
@@ -147,7 +147,7 @@ class GLMWebClient:
     def generate_images(self, payload: dict[str, object]) -> dict[str, object]:
         lease = self.request_queue.acquire(f"image:{payload.get('model', self.config.glm_image_model_name)}")
         try:
-            response, assistant_id = self._open_image_stream(payload)
+            response, assistant_id = self._open_image_stream(payload, preferred_account_index=self._get_preferred_account_index(lease.ticket))
         except Exception:
             lease.release()
             raise
@@ -175,7 +175,7 @@ class GLMWebClient:
     def stream_chat_completion(self, payload: dict[str, object]):
         lease = self.request_queue.acquire(f"stream:{payload.get('model', 'unknown')}")
         try:
-            response, assistant_id = self._open_chat_stream(payload)
+            response, assistant_id = self._open_chat_stream(payload, preferred_account_index=self._get_preferred_account_index(lease.ticket))
         except Exception:
             lease.release()
             raise
@@ -270,7 +270,7 @@ class GLMWebClient:
                 exc,
             )
 
-    def _open_chat_stream(self, openai_payload: dict[str, object]):
+    def _open_chat_stream(self, openai_payload: dict[str, object], preferred_account_index: int | None = None):
         requested_model = str(openai_payload.get("model", "glm-4"))
         upstream_model, assistant_id = resolve_upstream_model(requested_model, self.config)
         converted_messages = convert_messages(
@@ -368,10 +368,14 @@ class GLMWebClient:
 
             raise UpstreamAPIError(status_code=429, message="GLM 长时间忙碌，请稍后重试。")
 
-        response = self._call_with_account_failover(f"chat:{requested_model}", send_request)
+        response = self._call_with_account_failover(
+            f"chat:{requested_model}",
+            send_request,
+            preferred_account_index=preferred_account_index,
+        )
         return response, assistant_id
 
-    def _open_image_stream(self, payload: dict[str, object]):
+    def _open_image_stream(self, payload: dict[str, object], preferred_account_index: int | None = None):
         prompt = str(payload.get("prompt", "")).strip()
         if not prompt:
             raise UpstreamAPIError(status_code=400, message="图片生成请求缺少 prompt")
@@ -452,7 +456,11 @@ class GLMWebClient:
                 message = self._build_error_message(exc.code, error_payload)
                 raise UpstreamAPIError(status_code=exc.code, message=message, payload=error_payload) from exc
 
-        response = self._call_with_account_failover(f"image:{user_model}", send_request)
+        response = self._call_with_account_failover(
+            f"image:{user_model}",
+            send_request,
+            preferred_account_index=preferred_account_index,
+        )
         return response, self.config.glm_image_assistant_id
 
     def _prepare_chat_response(self, response):
@@ -774,11 +782,22 @@ class GLMWebClient:
             parts.append(f"rid={rid}")
         return " | ".join(parts)
 
-    def _call_with_account_failover(self, request_name: str, operation: Callable[[int, str], object]):
+    def _get_preferred_account_index(self, ticket: int) -> int | None:
+        account_count = self.auth.get_account_count()
+        if account_count <= 0:
+            return None
+        return ticket % account_count
+
+    def _call_with_account_failover(
+        self,
+        request_name: str,
+        operation: Callable[[int, str], object],
+        preferred_account_index: int | None = None,
+    ):
         account_count = self.auth.get_account_count()
         if account_count <= 0:
             raise RuntimeError("没有可用的 GLM 账号或游客 token 配置")
-        start_index = self.auth.get_current_account_index()
+        start_index = preferred_account_index % account_count if preferred_account_index is not None else self.auth.get_current_account_index()
         last_exc: Exception | None = None
 
         for offset in range(account_count):

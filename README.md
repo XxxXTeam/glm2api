@@ -74,6 +74,8 @@ GLM_USE_GUEST_REFRESH_TOKEN=true
 GLM_GUEST_MAX_RETRIES=3
 ```
 
+启用游客模式后，程序会按 `GLM_MAX_CONCURRENCY` 自动创建同等数量的游客账号槽位，让每个并发请求优先使用独立游客账号，避免多个并发长期挤在同一游客会话上。
+
 常用配置说明：
 
 - `HOST`
@@ -116,6 +118,7 @@ GLM_GUEST_MAX_RETRIES=3
 
 - 如果存在 `token.txt`，程序会优先从这里加载多账号
 - 如果显式设置了 `GLM_USE_GUEST_REFRESH_TOKEN=true`，程序会直接走游客模式
+- 游客模式下会按 `GLM_MAX_CONCURRENCY` 自动扩展游客账号池，尽量做到每个并发槽位对应一个独立游客账号
 - 当某个账号请求失败时，会自动切换到下一账号继续尝试
 - 如果本轮所有账号都失败，下一次会从第一个账号重新开始
 - 当上游返回新的 `refresh_token` 时，多账号模式会自动写回 `token.txt` 对应行

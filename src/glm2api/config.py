@@ -191,6 +191,7 @@ def load_config(env_file: str = ".env") -> AppConfig:
     env_file_created = ensure_env_file(env_path)
     file_values = parse_dotenv(env_path)
     values = {**file_values, **os.environ}
+    glm_max_concurrency = max(1, parse_int(values.get("GLM_MAX_CONCURRENCY"), 3))
     token_file_path = Path(values.get("GLM_TOKEN_FILE", "token.txt"))
     if not token_file_path.is_absolute():
         token_file_path = (env_path.parent / token_file_path).resolve()
@@ -198,12 +199,12 @@ def load_config(env_file: str = ".env") -> AppConfig:
     single_refresh_token = values.get("GLM_REFRESH_TOKEN", "").strip()
     explicit_guest_mode = parse_bool(values.get("GLM_USE_GUEST_REFRESH_TOKEN"), False) or is_guest_token_value(single_refresh_token)
     if explicit_guest_mode:
-        refresh_tokens = [GUEST_REFRESH_TOKEN_MARKER]
+        refresh_tokens = [GUEST_REFRESH_TOKEN_MARKER] * glm_max_concurrency
         single_refresh_token = GUEST_REFRESH_TOKEN_MARKER
     elif not refresh_tokens and single_refresh_token:
         refresh_tokens = [single_refresh_token]
     elif not refresh_tokens:
-        refresh_tokens = [GUEST_REFRESH_TOKEN_MARKER]
+        refresh_tokens = [GUEST_REFRESH_TOKEN_MARKER] * glm_max_concurrency
         single_refresh_token = GUEST_REFRESH_TOKEN_MARKER
         explicit_guest_mode = True
     host = values.get("HOST", "127.0.0.1").strip() or "127.0.0.1"
@@ -248,7 +249,7 @@ def load_config(env_file: str = ".env") -> AppConfig:
             ),
         ).strip(),
         glm_delete_conversation=parse_bool(values.get("GLM_DELETE_CONVERSATION"), True),
-        glm_max_concurrency=max(1, parse_int(values.get("GLM_MAX_CONCURRENCY"), 3)),
+        glm_max_concurrency=glm_max_concurrency,
         glm_queue_wait_timeout=parse_int(values.get("GLM_QUEUE_WAIT_TIMEOUT_SECONDS"), 600),
         glm_busy_max_retries=parse_int(values.get("GLM_BUSY_MAX_RETRIES"), 30),
         glm_busy_retry_interval=parse_float(values.get("GLM_BUSY_RETRY_INTERVAL_SECONDS"), 2.0),
