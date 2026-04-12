@@ -41,7 +41,7 @@ def _extract_balanced_json_object(text: str, start_index: int) -> tuple[str | No
     return None, start_index
 
 
-def build_tool_calls(block_content: str) -> list[dict[str, object]]:
+def build_tool_calls(block_content: str, allowed_tool_names: set[str] | None = None) -> list[dict[str, object]]:
     tool_calls: list[dict[str, object]] = []
     cursor = 0
     index = 0
@@ -56,6 +56,9 @@ def build_tool_calls(block_content: str) -> list[dict[str, object]]:
             break
         function_name = block_content[call_start + len(CALL_PREFIX) : name_end].strip()
         if not function_name:
+            cursor = name_end + 1
+            continue
+        if allowed_tool_names is not None and function_name not in allowed_tool_names:
             cursor = name_end + 1
             continue
 
@@ -100,7 +103,7 @@ def build_tool_calls(block_content: str) -> list[dict[str, object]]:
     return tool_calls
 
 
-def parse_tool_calls_from_text(text: str) -> tuple[str, list[dict[str, object]]]:
+def parse_tool_calls_from_text(text: str, allowed_tool_names: set[str] | None = None) -> tuple[str, list[dict[str, object]]]:
     if not text:
         return "", []
 
@@ -121,7 +124,7 @@ def parse_tool_calls_from_text(text: str) -> tuple[str, list[dict[str, object]]]
             break
 
         block_content = text[start_index + len(START_MARKER) : end_index]
-        tool_calls.extend(build_tool_calls(block_content))
+        tool_calls.extend(build_tool_calls(block_content, allowed_tool_names=allowed_tool_names))
         cursor = end_index + len(END_MARKER)
 
     cleaned = "".join(remaining_parts).strip()
@@ -134,6 +137,7 @@ class StreamingToolParser:
     buffered_tool_text: str = ""
     in_tool_block: bool = False
     tool_calls: list[dict[str, object]] = field(default_factory=list)
+    allowed_tool_names: set[str] | None = None
 
     def consume(self, chunk: str) -> str:
         if not chunk:
@@ -149,7 +153,7 @@ class StreamingToolParser:
                 if end_index == -1:
                     return "".join(visible)
                 block_content = self.buffered_tool_text[:end_index]
-                self.tool_calls.extend(build_tool_calls(block_content))
+                self.tool_calls.extend(build_tool_calls(block_content, allowed_tool_names=self.allowed_tool_names))
                 pending = self.buffered_tool_text[end_index + len(END_MARKER) :]
                 self.buffered_tool_text = ""
                 self.in_tool_block = False
@@ -176,7 +180,7 @@ class StreamingToolParser:
         if self.in_tool_block and self.buffered_tool_text:
             end_index = self.buffered_tool_text.find(END_MARKER)
             if end_index != -1:
-                self.tool_calls.extend(build_tool_calls(self.buffered_tool_text[:end_index]))
+                self.tool_calls.extend(build_tool_calls(self.buffered_tool_text[:end_index], allowed_tool_names=self.allowed_tool_names))
             else:
                 remaining += START_MARKER + self.buffered_tool_text
             self.buffered_tool_text = ""

@@ -22,7 +22,7 @@ from typing import Callable
 from ..config import AppConfig
 from ..logging_utils import debug_dump
 from .glm_auth import GLMAccessTokenManager, build_sign
-from .translator import GLMEventAccumulator, convert_messages, resolve_chat_mode, resolve_upstream_model
+from .translator import GLMEventAccumulator, convert_messages, filter_tools, resolve_chat_mode, resolve_upstream_model
 
 
 FILE_UPLOAD_URL_SUFFIX = "/backend-api/assistant/file_upload"
@@ -119,7 +119,23 @@ class GLMWebClient:
             max_concurrency=config.glm_max_concurrency,
         )
 
+    def _resolve_tools(self, openai_payload: dict[str, object]) -> tuple[list[dict[str, object]] | None, set[str] | None]:
+        raw_tools = list(openai_payload.get("tools", [])) if isinstance(openai_payload.get("tools"), list) else None # type: ignore
+        blocked_tool_names = {name.strip() for name in self.config.blocked_tool_names if name.strip()}
+        filtered_tools = filter_tools(raw_tools, blocked_tool_names)
+        if raw_tools and len(raw_tools) != len(filtered_tools or []):
+            blocked_names: list[str] = []
+            for tool in raw_tools:
+                fn = tool.get("function", {})
+                tool_name = str(fn.get("name", "")).strip()
+                if tool_name in blocked_tool_names:
+                    blocked_names.append(tool_name)
+            if blocked_names:
+                self.logger.info("已过滤不受支持的工具: %s", ", ".join(blocked_names))
+        return filtered_tools, {tool["function"]["name"] for tool in filtered_tools} if filtered_tools else None # type: ignore[index]
+
     def chat_completion(self, payload: dict[str, object]) -> tuple[dict[str, object], str | None]:
+        _, allowed_tool_names = self._resolve_tools(payload)
         lease = self.request_queue.acquire(f"chat:{payload.get('model', 'unknown')}")
         try:
             response, assistant_id = self._open_chat_stream(payload, preferred_account_index=self._get_preferred_account_index(lease.ticket))
@@ -128,6 +144,7 @@ class GLMWebClient:
             raise
         accumulator = GLMEventAccumulator(
             model=str(payload["model"]),
+            allowed_tool_names=allowed_tool_names,
             debug_enabled=self.config.debug_dump_all,
             logger=self.logger,
         )
@@ -174,6 +191,7 @@ class GLMWebClient:
             lease.release()
 
     def stream_chat_completion(self, payload: dict[str, object]):
+        _, allowed_tool_names = self._resolve_tools(payload)
         lease = self.request_queue.acquire(f"stream:{payload.get('model', 'unknown')}")
         try:
             response, assistant_id = self._open_chat_stream(payload, preferred_account_index=self._get_preferred_account_index(lease.ticket))
@@ -183,6 +201,7 @@ class GLMWebClient:
 
         accumulator = GLMEventAccumulator(
             model=str(payload["model"]),
+            allowed_tool_names=allowed_tool_names,
             debug_enabled=self.config.debug_dump_all,
             logger=self.logger,
         )
@@ -274,9 +293,11 @@ class GLMWebClient:
     def _open_chat_stream(self, openai_payload: dict[str, object], preferred_account_index: int | None = None):
         requested_model = str(openai_payload.get("model", "glm-4"))
         upstream_model, assistant_id = resolve_upstream_model(requested_model, self.config)
+        filtered_tools, _ = self._resolve_tools(openai_payload)
         converted_messages = convert_messages(
             messages=list(openai_payload.get("messages", [])), # type: ignore
-            tools=list(openai_payload.get("tools", [])) if isinstance(openai_payload.get("tools"), list) else None, # type: ignore
+            tools=filtered_tools,
+            blocked_tool_names={name.strip() for name in self.config.blocked_tool_names if name.strip()},
         )
         debug_dump(self.logger, self.config.debug_dump_all, "OpenAI 原始 chat 请求 payload", openai_payload)
         debug_dump(self.logger, self.config.debug_dump_all, "转换后的 GLM messages", converted_messages)

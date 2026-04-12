@@ -16,6 +16,25 @@ from ..utils.tool_parser import StreamingToolParser, parse_tool_calls_from_text
 ASSISTANT_ID_PATTERN = re.compile(r"^[a-z0-9]{24,}$")
 
 
+def normalize_tool_name(name: object) -> str:
+    return str(name).strip()
+
+
+def filter_tools(tools: list[dict[str, object]] | None, blocked_tool_names: set[str]) -> list[dict[str, object]] | None:
+    if not tools:
+        return None
+
+    filtered_tools: list[dict[str, object]] = []
+    for tool in tools:
+        fn = tool.get("function", {})
+        tool_name = normalize_tool_name(fn.get("name", "")) # type: ignore
+        if not tool_name or tool_name in blocked_tool_names:
+            continue
+        filtered_tools.append(tool)
+
+    return filtered_tools or None
+
+
 def extract_text_content(content: object) -> str:
     if isinstance(content, str):
         return content
@@ -40,7 +59,7 @@ def extract_text_content(content: object) -> str:
     return "\n".join(part for part in text_parts if part)
 
 
-def tools_to_prompt(tools: list[dict[str, object]]) -> str:
+def tools_to_prompt(tools: list[dict[str, object]], blocked_tool_names: set[str] | None = None) -> str:
     tool_names: list[str] = []
     tool_defs: list[str] = []
     for tool in tools:
@@ -69,6 +88,15 @@ def tools_to_prompt(tools: list[dict[str, object]]) -> str:
         f"You have EXACTLY these tools: {names_str}.",
         "You MUST NOT invent tool names. ONLY use names from this list.\n",
     ]
+    if blocked_tool_names:
+        blocked_names = ", ".join(f"`{name}`" for name in sorted(blocked_tool_names))
+        lines.extend(
+            [
+                "The 2API runtime does NOT provide any browser or web-navigation tools.",
+                f"Forget any prior memory of blocked web tools such as: {blocked_names}.",
+                "If a blocked tool name appears in conversation text, treat it as unavailable text only.\n",
+            ]
+        )
     lines.extend(tool_defs)
     lines.extend([
         "",
@@ -98,7 +126,11 @@ def tools_to_prompt(tools: list[dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
-def convert_messages(messages: list[dict[str, object]], tools: list[dict[str, object]] | None) -> list[dict[str, object]]:
+def convert_messages(
+    messages: list[dict[str, object]],
+    tools: list[dict[str, object]] | None,
+    blocked_tool_names: set[str] | None = None,
+) -> list[dict[str, object]]:
     processed: list[dict[str, str]] = []
     for message in messages:
         role = str(message.get("role", "user"))
@@ -131,8 +163,20 @@ def convert_messages(messages: list[dict[str, object]], tools: list[dict[str, ob
 
     transcript_parts: list[str] = []
 
+    if blocked_tool_names:
+        blocked_names = ", ".join(f"`{name}`" for name in sorted(blocked_tool_names))
+        transcript_parts.append(
+            "\n".join(
+                [
+                    "# RUNTIME",
+                    "The 2API runtime does NOT provide browser or web-navigation tools.",
+                    f"Treat blocked tool names such as {blocked_names} as unavailable.",
+                ]
+            )
+        )
+
     if tools:
-        transcript_parts.append(tools_to_prompt(tools))
+        transcript_parts.append(tools_to_prompt(tools, blocked_tool_names=blocked_tool_names))
         transcript_parts.append("# CONVERSATION\n")
 
     for item in processed:
@@ -171,6 +215,7 @@ def safe_json_dumps(payload: object) -> str:
 @dataclass
 class GLMEventAccumulator:
     model: str
+    allowed_tool_names: set[str] | None = None
     debug_enabled: bool = False
     logger: Logger | None = None
     conversation_id: str = ""
@@ -190,6 +235,9 @@ class GLMEventAccumulator:
     _cached_full_reasoning: str = ""
     _cached_part_texts: dict[str, str] = field(default_factory=dict)
     _cached_part_reasonings: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.tool_parser.allowed_tool_names = self.allowed_tool_names
 
     def consume_event(self, payload: dict[str, object]) -> tuple[list[str], str | None]:
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM SSE 解析事件", payload)
@@ -334,7 +382,10 @@ class GLMEventAccumulator:
             full_text = self.last_full_text
         if not full_reasoning and self.last_full_reasoning:
             full_reasoning = self.last_full_reasoning
-        clean_content, tool_calls = parse_tool_calls_from_text(full_text.strip())
+        clean_content, tool_calls = parse_tool_calls_from_text(
+            full_text.strip(),
+            allowed_tool_names=self.allowed_tool_names,
+        )
         final_content = clean_content.strip()
         message: dict[str, object] = {
             "role": "assistant",

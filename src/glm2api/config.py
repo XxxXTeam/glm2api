@@ -11,6 +11,17 @@ DEFAULT_IMAGE_ASSISTANT_ID = "65a232c082ff90a2ad2f15e2"
 DEFAULT_IMAGE_MODEL_NAME = "glm-image-1"
 DEFAULT_GLM_BASE_URL = "https://chatglm.cn/chatglm"
 GUEST_REFRESH_TOKEN_MARKER = "__glm_guest__"
+DEFAULT_BLOCKED_TOOL_NAMES = (
+    "open_url",
+    "open_ul",
+    "browser.open",
+    "web.run",
+    "web.open",
+    "web.search",
+    "web_search",
+    "browse",
+    "open_link",
+)
 BUILTIN_EXPOSED_MODELS = (
     "cogView-4-250304",
     "glm-5.1",
@@ -144,6 +155,7 @@ class AppConfig:
     glm_busy_max_retries: int
     glm_busy_retry_interval: float
     glm_guest_max_retries: int
+    blocked_tool_names: list[str]
     exposed_models: list[str]
     model_aliases: dict[str, str]
     server_api_keys: list[str]
@@ -254,6 +266,7 @@ def load_config(env_file: str = ".env") -> AppConfig:
         glm_busy_max_retries=parse_int(values.get("GLM_BUSY_MAX_RETRIES"), 30),
         glm_busy_retry_interval=parse_float(values.get("GLM_BUSY_RETRY_INTERVAL_SECONDS"), 2.0),
         glm_guest_max_retries=max(0, parse_int(values.get("GLM_GUEST_MAX_RETRIES"), 3)),
+        blocked_tool_names=parse_list(values.get("BLOCKED_TOOL_NAMES"), DEFAULT_BLOCKED_TOOL_NAMES),
         exposed_models=exposed_models, # type: ignore
         model_aliases=model_aliases,
         server_api_keys=parse_list(values.get("SERVER_API_KEYS")),
