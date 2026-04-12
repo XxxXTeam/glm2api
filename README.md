@@ -89,6 +89,7 @@ GLM_GUEST_MAX_RETRIES=3
 
 - `DEBUG_DUMP_ALL`
   调试狂暴模式。开启后会自动切到 `DEBUG`，并打印入站原始请求、转发给 GLM 的原始 body、上游原始响应和 SSE 分片、工具调用转换结果等几乎所有调试信息
+  当 LOG_LEVEL=DEBUG（或 DEBUG_DUMP_ALL=true）时，自动在 log/glm2api_debug.log 写入日志文件（LOG_LEVEL=INFO — 只有终端输出，不写文件）
 
 - `GLM_ASSISTANT_ID`
   普通对话使用的 assistant id

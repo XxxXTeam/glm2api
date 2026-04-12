@@ -6,10 +6,24 @@ import traceback
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging import Logger
+from urllib.parse import urlparse
 
 from .config import AppConfig
 from .logging_utils import debug_dump
+from .services.anthropic_adapter import (
+    AnthropicStreamAccumulator,
+    anthropic_to_openai,
+    openai_to_anthropic_response,
+)
 from .services.glm_client import GLMWebClient, QueueTimeoutError, UpstreamAPIError
+from .services.responses_adapter import (
+    ResponsesStreamAccumulator,
+    openai_to_responses,
+    responses_to_openai,
+)
+
+
+_CLIENT_DISCONNECTED = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout)
 
 
 class GLM2APIServer:
@@ -46,11 +60,12 @@ class GLM2APIServer:
             def do_GET(self) -> None:
                 try:
                     self._debug_log_request_start()
-                    if self.path == "/health":
+                    path = self._path_without_query()
+                    if path == "/health":
                         self._write_json(HTTPStatus.OK, {"status": "ok"})
                         return
 
-                    if self.path == f"{config.api_prefix}/models":
+                    if path == f"{config.api_prefix}/models":
                         self._write_json(
                             HTTPStatus.OK,
                             {
@@ -64,10 +79,8 @@ class GLM2APIServer:
                         return
 
                     self._write_json(HTTPStatus.NOT_FOUND, {"error": {"message": "Not Found"}})
-                except BrokenPipeError:
+                except _CLIENT_DISCONNECTED:
                     logger.warning("客户端在 GET 响应写回前断开 path=%s", self.path)
-                except ConnectionResetError:
-                    logger.warning("客户端重置了 GET 连接 path=%s", self.path)
                 except Exception as exc:
                     logger.error("处理 GET 请求失败 path=%s error=%s\n%s", self.path, exc, traceback.format_exc())
                     self._safe_write_json(
@@ -78,9 +91,12 @@ class GLM2APIServer:
             def do_POST(self) -> None:
                 try:
                     self._debug_log_request_start()
-                    if self.path not in {
+                    path = self._path_without_query()
+                    if path not in {
                         f"{config.api_prefix}/chat/completions",
                         f"{config.api_prefix}/images/generations",
+                        f"{config.api_prefix}/messages",
+                        f"{config.api_prefix}/responses",
                     }:
                         self._write_json(HTTPStatus.NOT_FOUND, {"error": {"message": "Not Found"}})
                         return
@@ -126,7 +142,18 @@ class GLM2APIServer:
                         return
                     debug_dump(logger, config.debug_dump_all, f"HTTP 入站解析后 JSON path={self.path}", payload)
 
-                    if self.path == f"{config.api_prefix}/images/generations":
+                    # --- Anthropic Messages API ---
+                    if path == f"{config.api_prefix}/messages":
+                        self._handle_anthropic_messages(payload)
+                        return
+
+                    # --- OpenAI Responses API ---
+                    if path == f"{config.api_prefix}/responses":
+                        self._handle_responses(payload)
+                        return
+
+                    # --- Image generation ---
+                    if path == f"{config.api_prefix}/images/generations":
                         if not payload.get("prompt"):
                             self._write_json(
                                 HTTPStatus.BAD_REQUEST,
@@ -137,6 +164,7 @@ class GLM2APIServer:
                         self._write_json(HTTPStatus.OK, result)
                         return
 
+                    # --- Chat completions ---
                     if not isinstance(payload.get("messages"), list) or not payload.get("model"):
                         self._write_json(
                             HTTPStatus.BAD_REQUEST,
@@ -169,7 +197,7 @@ class GLM2APIServer:
                         HTTPStatus.BAD_REQUEST,
                         {"error": {"message": str(exc), "type": "invalid_request"}},
                     )
-                except (BrokenPipeError, ConnectionResetError, socket.timeout) as exc:
+                except _CLIENT_DISCONNECTED as exc:
                     logger.warning("客户端连接提前断开 path=%s error=%s", self.path, exc)
                 except Exception as exc:
                     logger.error("处理请求失败 error=%s\n%s", exc, traceback.format_exc())
@@ -177,6 +205,119 @@ class GLM2APIServer:
                         HTTPStatus.BAD_GATEWAY,
                         {"error": {"message": str(exc), "type": exc.__class__.__name__}},
                     )
+
+            # ---- Anthropic Messages API ----
+
+            def _handle_anthropic_messages(self, payload: dict[str, object]) -> None:
+                model = str(payload.get("model", "glm-4"))
+                openai_payload = anthropic_to_openai(payload)
+
+                if payload.get("stream"):
+                    self._stream_anthropic(openai_payload, model)
+                    return
+
+                result, _ = glm_client.chat_completion(openai_payload)
+                response = openai_to_anthropic_response(result, model)
+                self._write_json(HTTPStatus.OK, response)
+
+            def _stream_anthropic(self, openai_payload: dict[str, object], model: str) -> None:
+                openai_payload["stream"] = True
+                stream_iter = glm_client.stream_chat_completion(openai_payload)
+                accumulator = AnthropicStreamAccumulator(model=model)
+
+                self.send_response(HTTPStatus.OK)
+                self._send_common_headers()
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                try:
+                    for chunk in stream_iter:
+                        if not chunk:
+                            continue
+                        if not accumulator.started:
+                            start_event = accumulator.start_message()
+                            self.wfile.write(start_event.encode("utf-8"))
+                            self.wfile.flush()
+                        events = accumulator.feed_chunk(chunk)
+                        for event in events:
+                            self.wfile.write(event.encode("utf-8"))
+                            self.wfile.flush()
+                except _CLIENT_DISCONNECTED as exc:
+                    logger.warning("客户端在 Anthropic 流式响应过程中断开 model=%s error=%s", model, exc)
+                    return
+                except Exception as exc:
+                    logger.error("Anthropic 流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
+
+                # Ensure message_stop is always sent (idempotent via _finished flag)
+                if accumulator.started:
+                    try:
+                        for event in accumulator._finish():
+                            self.wfile.write(event.encode("utf-8"))
+                            self.wfile.flush()
+                    except _CLIENT_DISCONNECTED:
+                        pass
+
+                logger.info("Anthropic 流式请求完成 model=%s", model)
+
+            # ---- OpenAI Responses API ----
+
+            def _handle_responses(self, payload: dict[str, object]) -> None:
+                model = str(payload.get("model", "glm-4"))
+                openai_payload = responses_to_openai(payload)
+
+                if payload.get("stream"):
+                    self._stream_responses(openai_payload, model)
+                    return
+
+                result, _ = glm_client.chat_completion(openai_payload)
+                response = openai_to_responses(result, model)
+                self._write_json(HTTPStatus.OK, response)
+
+            def _stream_responses(self, openai_payload: dict[str, object], model: str) -> None:
+                openai_payload["stream"] = True
+                stream_iter = glm_client.stream_chat_completion(openai_payload)
+                accumulator = ResponsesStreamAccumulator(model=model)
+
+                self.send_response(HTTPStatus.OK)
+                self._send_common_headers()
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                try:
+                    for chunk in stream_iter:
+                        if not chunk:
+                            continue
+                        if not accumulator.started:
+                            start_events = accumulator.start_response()
+                            for event in start_events:
+                                self.wfile.write(event.encode("utf-8"))
+                            self.wfile.flush()
+                        events = accumulator.feed_chunk(chunk)
+                        for event in events:
+                            self.wfile.write(event.encode("utf-8"))
+                            self.wfile.flush()
+                except _CLIENT_DISCONNECTED as exc:
+                    logger.warning("客户端在 Responses 流式响应过程中断开 model=%s error=%s", model, exc)
+                    return
+                except Exception as exc:
+                    logger.error("Responses 流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
+
+                # Ensure response.completed is always sent (idempotent via _finished flag)
+                if accumulator.started:
+                    try:
+                        for event in accumulator._finish():
+                            self.wfile.write(event.encode("utf-8"))
+                            self.wfile.flush()
+                    except _CLIENT_DISCONNECTED:
+                        pass
+
+                logger.info("Responses 流式请求完成 model=%s", model)
+
+            # ---- Chat completions (original) ----
 
             def _stream_completion(self, payload: dict[str, object]) -> None:
                 stream_iter = glm_client.stream_chat_completion(payload)
@@ -199,7 +340,7 @@ class GLM2APIServer:
                 except UpstreamAPIError as exc:
                     logger.warning("流式请求中途收到上游错误 status=%s error=%s", exc.status_code, exc)
                     self._write_sse_error(str(exc), "upstream_error")
-                except (BrokenPipeError, ConnectionResetError, socket.timeout) as exc:
+                except _CLIENT_DISCONNECTED as exc:
                     logger.warning("客户端在流式响应过程中断开 model=%s error=%s", payload.get("model"), exc)
                     return
                 except Exception as exc:
@@ -210,18 +351,27 @@ class GLM2APIServer:
                         try:
                             self.wfile.write(b"data: [DONE]\n\n")
                             self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                        except _CLIENT_DISCONNECTED:
                             pass
                 logger.info("流式请求完成 model=%s", payload.get("model"))
+
+            # ---- Auth ----
 
             def _authorize(self) -> bool:
                 if not config.server_api_keys:
                     return True
+                # Support both Bearer token and x-api-key header (Anthropic style)
                 authorization = self.headers.get("Authorization", "")
-                if not authorization.startswith("Bearer "):
-                    return False
-                token = authorization[7:].strip()
-                return token in config.server_api_keys
+                if authorization.startswith("Bearer "):
+                    token = authorization[7:].strip()
+                    if token in config.server_api_keys:
+                        return True
+                x_api_key = self.headers.get("x-api-key", "")
+                if x_api_key and x_api_key.strip() in config.server_api_keys:
+                    return True
+                return False
+
+            # ---- Helpers ----
 
             def _write_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
                 body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -235,13 +385,16 @@ class GLM2APIServer:
 
             def _send_common_headers(self) -> None:
                 self.send_header("Access-Control-Allow-Origin", config.cors_allow_origin)
-                self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+                self.send_header(
+                    "Access-Control-Allow-Headers",
+                    "Authorization, Content-Type, x-api-key, anthropic-version",
+                )
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
             def _safe_write_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
                 try:
                     self._write_json(status, payload)
-                except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                except _CLIENT_DISCONNECTED:
                     logger.warning("客户端在 JSON 响应写回前断开 path=%s", self.path)
 
             def _parse_content_length(self) -> int:
@@ -262,7 +415,7 @@ class GLM2APIServer:
                     payload = f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8")
                     self.wfile.write(payload)
                     self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                except _CLIENT_DISCONNECTED:
                     logger.warning("客户端在 SSE 错误写回前断开 path=%s", self.path)
 
             def _safe_http_status(self, value: int, fallback: HTTPStatus) -> HTTPStatus:
@@ -278,6 +431,9 @@ class GLM2APIServer:
                     f"HTTP 入站请求 {self.command} {self.path} headers",
                     {key: value for key, value in self.headers.items()},
                 )
+
+            def _path_without_query(self) -> str:
+                return urlparse(self.path).path
 
             def log_message(self, format: str, *args) -> None:
                 logger.info("%s - %s", self.address_string(), format % args)

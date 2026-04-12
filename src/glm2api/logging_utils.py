@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any
 
 
@@ -13,6 +16,9 @@ COLORS = {
     "ERROR": "\033[31m",
     "CRITICAL": "\033[35m",
 }
+
+LOG_FMT = "[%(asctime)s][%(levelname)s]%(name)s | %(message)s"
+LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
 
 
 class ColorFormatter(logging.Formatter):
@@ -30,16 +36,26 @@ class ColorFormatter(logging.Formatter):
 def setup_logging(level: str) -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(
-        ColorFormatter(
-            fmt="[%(asctime)s][%(levelname)s]%(name)s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
+        ColorFormatter(fmt=LOG_FMT, datefmt=LOG_DATEFMT)
     )
     root = logging.getLogger()
     root.handlers.clear()
     resolved_level = getattr(logging, str(level).upper(), logging.INFO)
     root.setLevel(resolved_level)
     root.addHandler(handler)
+
+    if resolved_level <= logging.DEBUG:
+        log_dir = Path(os.environ.get("GLM2API_LOG_DIR", "log"))
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_dir / "glm2api_debug.log",
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter(fmt=LOG_FMT, datefmt=LOG_DATEFMT))
+        root.addHandler(file_handler)
 
 
 def get_logger(name: str) -> logging.Logger:
