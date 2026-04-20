@@ -15,3 +15,5 @@ wheels/
 log
 docs
 tests
+
+main.spec
