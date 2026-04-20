@@ -139,6 +139,8 @@ def responses_to_openai(payload: dict[str, object]) -> dict[str, object]:
                 })
         if openai_tools:
             result["tools"] = openai_tools
+    if payload.get("tool_choice") is not None:
+        result["tool_choice"] = payload["tool_choice"]
 
     # --- reasoning ---
     reasoning = payload.get("reasoning")

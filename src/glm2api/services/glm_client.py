@@ -298,6 +298,7 @@ class GLMWebClient:
             messages=list(openai_payload.get("messages", [])), # type: ignore
             tools=filtered_tools,
             blocked_tool_names={name.strip() for name in self.config.blocked_tool_names if name.strip()},
+            tool_choice=openai_payload.get("tool_choice"),
         )
         debug_dump(self.logger, self.config.debug_dump_all, "OpenAI 原始 chat 请求 payload", openai_payload)
         debug_dump(self.logger, self.config.debug_dump_all, "转换后的 GLM messages", converted_messages)

@@ -59,100 +59,222 @@ def extract_text_content(content: object) -> str:
     return "\n".join(part for part in text_parts if part)
 
 
-def tools_to_prompt(tools: list[dict[str, object]], blocked_tool_names: set[str] | None = None) -> str:
+def safe_json_dumps(payload: object) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def parse_tool_choice_policy(tool_choice: object, available_tool_names: set[str] | None = None) -> dict[str, object]:
+    available = available_tool_names or set()
+    if tool_choice is None:
+        return {"mode": "auto", "tool_name": None}
+    if isinstance(tool_choice, str):
+        normalized = tool_choice.strip().lower()
+        if normalized in {"auto", "none", "required"}:
+            return {"mode": normalized, "tool_name": None}
+        return {"mode": "auto", "tool_name": None}
+    if not isinstance(tool_choice, dict):
+        return {"mode": "auto", "tool_name": None}
+
+    choice_type = str(tool_choice.get("type", "")).strip().lower()
+    if choice_type == "function":
+        function = tool_choice.get("function", {})
+        if isinstance(function, dict):
+            tool_name = str(function.get("name", "")).strip()
+            if tool_name and (not available or tool_name in available):
+                return {"mode": "specific", "tool_name": tool_name}
+        return {"mode": "auto", "tool_name": None}
+
+    if choice_type in {"auto", "none", "required"}:
+        return {"mode": choice_type, "tool_name": None}
+    return {"mode": "auto", "tool_name": None}
+
+
+def _xml_escape_text(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
+def _xml_wrap_scalar(value: object) -> str:
+    if isinstance(value, str):
+        return f"<![CDATA[{value.replace(']]>', ']]]]><![CDATA[>')}]]>"
+    return safe_json_dumps(value)
+
+
+def _xml_parameters_from_object(payload: object) -> str:
+    if isinstance(payload, dict):
+        parts: list[str] = []
+        for key, value in payload.items():
+            tag = re.sub(r"[^a-zA-Z0-9_.:-]", "_", str(key).strip()) or "value"
+            parts.append(f"<{tag}>{_xml_parameters_from_object(value)}</{tag}>")
+        return "".join(parts)
+    if isinstance(payload, list):
+        return "".join(f"<item>{_xml_parameters_from_object(item)}</item>" for item in payload)
+    return _xml_wrap_scalar(payload)
+
+
+def serialize_tool_call_block(name: str, arguments: object) -> str:
+    parsed_arguments = arguments
+    if isinstance(arguments, str):
+        try:
+            parsed_arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            parsed_arguments = {"raw": arguments}
+    if not isinstance(parsed_arguments, dict):
+        parsed_arguments = {"value": parsed_arguments}
+    return (
+        "<tool_calls>\n"
+        "  <tool_call>\n"
+        f"    <tool_name>{_xml_escape_text(name)}</tool_name>\n"
+        f"    <parameters>{_xml_parameters_from_object(parsed_arguments)}</parameters>\n"
+        "  </tool_call>\n"
+        "</tool_calls>"
+    )
+
+
+def serialize_tool_result_block(tool_call_id: object, tool_name: str, content: str) -> str:
+    safe_content = content.replace("]]>", "]]]]><![CDATA[>")
+    return (
+        f'<tool_result call_id="{_xml_escape_text(str(tool_call_id or "unknown"))}" '
+        f'name="{_xml_escape_text(tool_name)}"><content><![CDATA[{safe_content}]]></content></tool_result>'
+    )
+
+
+def build_tool_call_instructions(tool_names: list[str], tool_choice_policy: dict[str, object] | None = None) -> str:
+    available_names = ", ".join(f"`{name}`" for name in tool_names) or "`(none)`"
+    policy = tool_choice_policy or {"mode": "auto", "tool_name": None}
+    mode = str(policy.get("mode", "auto"))
+    specific_name = str(policy.get("tool_name", "") or "")
+    lines = [
+        "# TOOL CALLING",
+        f"You may call only these tools: {available_names}.",
+        "When you call a tool, output XML only and do not include any prose in that same answer.",
+        "Use this exact wrapper:",
+        "<tool_calls>",
+        "  <tool_call>",
+        "    <tool_name>TOOL_NAME</tool_name>",
+        "    <parameters>",
+        "      <param_name><![CDATA[value]]></param_name>",
+        "    </parameters>",
+        "  </tool_call>",
+        "</tool_calls>",
+        "Rules:",
+        "- Never invent tool names outside the declared list.",
+        "- Never emit OpenAI JSON tool_calls objects directly.",
+        "- Never mix normal explanation text with executable tool XML.",
+        "- For strings, prefer <![CDATA[...]]> wrappers.",
+        "- For multiple calls, place multiple <tool_call> nodes inside one <tool_calls> root.",
+        "- After receiving a <tool_result> block, continue from that result and call another tool only when necessary.",
+    ]
+    if mode == "none":
+        lines.extend(
+            [
+                "Tool choice policy: none.",
+                "Do not call any tool. Answer with normal text only.",
+            ]
+        )
+    elif mode == "required":
+        lines.extend(
+            [
+                "Tool choice policy: required.",
+                "You must call at least one tool before giving a final answer.",
+            ]
+        )
+    elif mode == "specific" and specific_name:
+        lines.extend(
+            [
+                "Tool choice policy: specific function.",
+                f"You must call exactly `{specific_name}` before giving a final answer.",
+                f"Do not call any tool other than `{specific_name}`.",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def tools_to_prompt(
+    tools: list[dict[str, object]],
+    blocked_tool_names: set[str] | None = None,
+    tool_choice_policy: dict[str, object] | None = None,
+) -> str:
     tool_names: list[str] = []
-    tool_defs: list[str] = []
+    tool_schemas: list[str] = []
     for tool in tools:
         fn = tool.get("function", {})
         name = str(fn.get("name", "unknown")) # type: ignore
-        tool_names.append(name)
-        description = fn.get("description", "") # type: ignore
+        description = str(fn.get("description", "") or "") # type: ignore
         parameters = fn.get("parameters", {}) # type: ignore
-        required = parameters.get("required", []) if isinstance(parameters, dict) else [] # type: ignore
-        props = parameters.get("properties", {}) if isinstance(parameters, dict) else {} # type: ignore
-        param_parts: list[str] = []
-        if isinstance(props, dict):
-            for pname, pdef in props.items():
-                ptype = pdef.get("type", "string") if isinstance(pdef, dict) else "string"
-                pdesc = pdef.get("description", "") if isinstance(pdef, dict) else ""
-                req_mark = " (required)" if pname in required else ""
-                param_parts.append(f"  - {pname}: {ptype}{req_mark}" + (f" — {pdesc}" if pdesc else ""))
-        desc_line = f": {description}" if description else ""
-        param_block = "\n".join(param_parts) if param_parts else "  (no parameters)"
-        tool_defs.append(f"- `{name}`{desc_line}\n  Parameters:\n{param_block}")
+        tool_names.append(name)
+        tool_schemas.append(
+            "\n".join(
+                [
+                    f"Tool: {name}",
+                    f"Description: {description}",
+                    f"Parameters: {safe_json_dumps(parameters) if isinstance(parameters, dict) else '{}'}",
+                ]
+            )
+        )
 
-    names_str = ", ".join(f"`{n}`" for n in tool_names)
-
-    lines = [
-        f"# TOOLS\n",
-        f"You have EXACTLY these tools: {names_str}.",
-        "You MUST NOT invent tool names. ONLY use names from this list.\n",
+    parts = [
+        "# TOOLS",
+        "You must treat the following tool schemas as authoritative.",
+        "",
+        "\n\n".join(tool_schemas),
+        "",
+        build_tool_call_instructions(tool_names, tool_choice_policy=tool_choice_policy),
     ]
     if blocked_tool_names:
-        blocked_names = ", ".join(f"`{name}`" for name in sorted(blocked_tool_names))
-        lines.extend(
+        parts.extend(
             [
-                "The 2API runtime does NOT provide any browser or web-navigation tools.",
-                f"Forget any prior memory of blocked web tools such as: {blocked_names}.",
-                "If a blocked tool name appears in conversation text, treat it as unavailable text only.\n",
+                "",
+                "# BLOCKED TOOLS",
+                f"These names are unavailable even if mentioned elsewhere: {', '.join(sorted(blocked_tool_names))}.",
             ]
         )
-    lines.extend(tool_defs)
-    lines.extend([
-        "",
-        "# HOW TO CALL",
-        "To call tools, output EXACTLY this format and NOTHING ELSE in the same turn:",
-        "",
-        "[function_calls]",
-        '[call:TOOL_NAME]{"param":"value"}[/call]',
-        "[/function_calls]",
-        "",
-        "Multiple calls in one turn:",
-        "",
-        "[function_calls]",
-        '[call:tool1]{"a":"1"}[/call]',
-        '[call:tool2]{"b":"2"}[/call]',
-        "[/function_calls]",
-        "",
-        "ABSOLUTE RULES:",
-        "- Output ONLY the [function_calls] block when calling tools. NO text before or after.",
-        "- NEVER invent tools that are not in the list above.",
-        "- NEVER output tool names like open_url, browser, fetch, etc. unless they are in the list.",
-        "- NEVER say 'I cannot call tools' — you CAN. Use the [function_calls] format.",
-        "- NEVER suggest the user run commands manually if you have a tool that can do it.",
-        "- JSON arguments must be on ONE line, valid JSON.",
-        "- After receiving [TOOL_RESULT]...[/TOOL_RESULT], continue using results. Call more tools if needed.",
-    ])
-    return "\n".join(lines)
+    return "\n".join(part for part in parts if part is not None).strip()
 
 
 def convert_messages(
     messages: list[dict[str, object]],
     tools: list[dict[str, object]] | None,
     blocked_tool_names: set[str] | None = None,
+    tool_choice: object | None = None,
 ) -> list[dict[str, object]]:
+    available_tool_names = {
+        str(tool.get("function", {}).get("name", "")).strip()
+        for tool in (tools or [])
+        if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+    }
+    available_tool_names.discard("")
+    tool_choice_policy = parse_tool_choice_policy(tool_choice, available_tool_names)
     processed: list[dict[str, str]] = []
     for message in messages:
         role = str(message.get("role", "user"))
         content = message.get("content")
         if role == "assistant" and message.get("tool_calls"):
-            tool_calls = []
+            tool_blocks: list[str] = []
             for tool_call in message.get("tool_calls", []): # pyright: ignore[reportGeneralTypeIssues]
                 function = tool_call.get("function", {})
-                tool_calls.append(
-                    f"[call:{function.get('name', 'unknown')}]{function.get('arguments', '{}')}[/call]"
+                tool_blocks.append(
+                    serialize_tool_call_block(
+                        name=str(function.get("name", "unknown")),
+                        arguments=function.get("arguments", "{}"),
+                    )
                 )
             assistant_text = extract_text_content(content).strip() if content else ""
-            block = "[function_calls]\n" + "\n".join(tool_calls) + "\n[/function_calls]"
+            block = "\n".join(tool_blocks)
             content = f"{assistant_text}\n{block}".strip() if assistant_text else block
         elif role == "tool":
             role = "user"
             tool_name = str(message.get("name", "")).strip() or "unknown_tool"
             tool_result_text = extract_text_content(content)
-            content = (
-                f"[TOOL_RESULT call_id={message.get('tool_call_id', 'unknown')} name={tool_name}]\n"
-                f"{tool_result_text}\n"
-                f"[/TOOL_RESULT]"
+            content = serialize_tool_result_block(
+                tool_call_id=message.get("tool_call_id", "unknown"),
+                tool_name=tool_name,
+                content=tool_result_text,
             )
         elif role == "assistant" and not content:
             continue
@@ -164,20 +286,25 @@ def convert_messages(
     transcript_parts: list[str] = []
 
     if blocked_tool_names:
-        blocked_names = ", ".join(f"`{name}`" for name in sorted(blocked_tool_names))
         transcript_parts.append(
             "\n".join(
                 [
                     "# RUNTIME",
-                    "The 2API runtime does NOT provide browser or web-navigation tools.",
-                    f"Treat blocked tool names such as {blocked_names} as unavailable.",
+                    "The runtime may reject blocked tool names even if the conversation mentions them.",
+                    f"Blocked names: {', '.join(sorted(blocked_tool_names))}.",
                 ]
             )
         )
 
-    if tools:
-        transcript_parts.append(tools_to_prompt(tools, blocked_tool_names=blocked_tool_names))
-        transcript_parts.append("# CONVERSATION\n")
+    if tools and tool_choice_policy.get("mode") != "none":
+        transcript_parts.append(
+            tools_to_prompt(
+                tools,
+                blocked_tool_names=blocked_tool_names,
+                tool_choice_policy=tool_choice_policy,
+            )
+        )
+        transcript_parts.append("# CONVERSATION")
 
     for item in processed:
         title = (
@@ -206,10 +333,6 @@ def resolve_chat_mode(model: str, reasoning_effort: object, deep_research: objec
     if reasoning_effort or "think" in lower_model or "zero" in lower_model:
         return "zero"
     return ""
-
-
-def safe_json_dumps(payload: object) -> str:
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 @dataclass
@@ -253,9 +376,8 @@ class GLMEventAccumulator:
                 self._render_cache_dirty = True
 
         text_delta, reasoning_delta = self._compute_deltas()
-        full_text, full_reasoning = self._cached_full_text, self._cached_full_reasoning
-        self.last_full_text = full_text
-        self.last_full_reasoning = full_reasoning
+        self.last_full_text = self._cached_full_text
+        self.last_full_reasoning = self._cached_full_reasoning
 
         chunks: list[str] = []
         if reasoning_delta:
@@ -465,8 +587,8 @@ class GLMEventAccumulator:
             if not isinstance(content_items, list):
                 continue
 
-            part_text = []
-            part_reasoning = []
+            part_text: list[str] = []
+            part_reasoning: list[str] = []
             for content in content_items:
                 if not isinstance(content, dict):
                     continue

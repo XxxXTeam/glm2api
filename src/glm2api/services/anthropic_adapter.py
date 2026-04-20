@@ -171,6 +171,17 @@ def anthropic_to_openai(payload: dict[str, object]) -> dict[str, object]:
             })
         if openai_tools:
             result["tools"] = openai_tools
+    tool_choice = payload.get("tool_choice")
+    if isinstance(tool_choice, dict):
+        choice_type = str(tool_choice.get("type", "")).strip().lower()
+        if choice_type == "auto":
+            result["tool_choice"] = "auto"
+        elif choice_type == "any":
+            result["tool_choice"] = "required"
+        elif choice_type == "tool":
+            name = str(tool_choice.get("name", "")).strip()
+            if name:
+                result["tool_choice"] = {"type": "function", "function": {"name": name}}
 
     # --- thinking ---
     thinking = payload.get("thinking")

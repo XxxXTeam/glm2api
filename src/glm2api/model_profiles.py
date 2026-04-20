@@ -12,12 +12,12 @@ class ModelProfile:
 
 
 MODEL_PROFILES: dict[str, ModelProfile] = {
-    "glm": ModelProfile("glm", False, "bracket", "bracket"),
-    "glm-4": ModelProfile("glm-4", False, "bracket", "bracket"),
-    "glm-4v": ModelProfile("glm-4v", False, "bracket", "bracket"),
-    "glm-zero-preview": ModelProfile("glm-zero-preview", False, "bracket", "bracket"),
-    "glm-deep-research": ModelProfile("glm-deep-research", False, "bracket", "bracket"),
-    "default": ModelProfile("default", False, "bracket", "bracket"),
+    "glm": ModelProfile("glm", False, "xml", "xml"),
+    "glm-4": ModelProfile("glm-4", False, "xml", "xml"),
+    "glm-4v": ModelProfile("glm-4v", False, "xml", "xml"),
+    "glm-zero-preview": ModelProfile("glm-zero-preview", False, "xml", "xml"),
+    "glm-deep-research": ModelProfile("glm-deep-research", False, "xml", "xml"),
+    "default": ModelProfile("default", False, "xml", "xml"),
 }
 
 
