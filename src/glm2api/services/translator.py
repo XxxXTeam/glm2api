@@ -14,6 +14,18 @@ from ..utils.tool_parser import StreamingToolParser, parse_tool_calls_from_text
 
 
 ASSISTANT_ID_PATTERN = re.compile(r"^[a-z0-9]{24,}$")
+CANONICAL_TOOL_CALL_EXAMPLE = "\n".join(
+    [
+        "<tool_calls>",
+        "  <tool_call>",
+        "    <tool_name>TOOL_NAME</tool_name>",
+        "    <parameters>",
+        "      <param_name><![CDATA[value]]></param_name>",
+        "    </parameters>",
+        "  </tool_call>",
+        "</tool_calls>",
+    ]
+)
 
 
 def normalize_tool_name(name: object) -> str:
@@ -150,31 +162,30 @@ def build_tool_call_instructions(tool_names: list[str], tool_choice_policy: dict
     mode = str(policy.get("mode", "auto"))
     specific_name = str(policy.get("tool_name", "") or "")
     lines = [
-        "# TOOL CALLING",
-        f"You may call only these tools: {available_names}.",
-        "When you call a tool, output XML only and do not include any prose in that same answer.",
-        "Use this exact wrapper:",
-        "<tool_calls>",
-        "  <tool_call>",
-        "    <tool_name>TOOL_NAME</tool_name>",
-        "    <parameters>",
-        "      <param_name><![CDATA[value]]></param_name>",
-        "    </parameters>",
-        "  </tool_call>",
-        "</tool_calls>",
+        "# TOOL USE PROTOCOL",
+        "The following tool schemas are the only executable tool definitions for this turn.",
+        f"Allowed tool names: {available_names}.",
+        "If a tool is needed, output executable XML/Markup only. Do not add prose in the same assistant answer.",
+        "Canonical format:",
+        CANONICAL_TOOL_CALL_EXAMPLE,
+        "The server will parse this XML/Markup intermediate language back into standard OpenAI tool_calls.",
+        "Supported argument encodings inside a tool block:",
+        "- Nested XML tags under <parameters> / <arguments> / <input>.",
+        '- <parameter name="...">value</parameter> or <argument name="...">value</argument>.',
+        "- A JSON object placed inside <parameters>, <arguments>, or <input>.",
         "Rules:",
-        "- Never invent tool names outside the declared list.",
-        "- Never emit OpenAI JSON tool_calls objects directly.",
-        "- Never mix normal explanation text with executable tool XML.",
-        "- For strings, prefer <![CDATA[...]]> wrappers.",
-        "- For multiple calls, place multiple <tool_call> nodes inside one <tool_calls> root.",
-        "- After receiving a <tool_result> block, continue from that result and call another tool only when necessary.",
+        "- Do not invent tool names outside the declared list.",
+        "- Do not emit OpenAI JSON tool_calls arrays or function_call objects directly.",
+        "- Do not mix normal explanation text with executable tool markup.",
+        "- Prefer <![CDATA[...]]> for arbitrary strings.",
+        "- Put multiple calls inside one <tool_calls> root when you truly need multiple calls in one turn.",
+        "- After a <tool_result ...> block, continue from that result and call another tool only when necessary.",
     ]
     if mode == "none":
         lines.extend(
             [
                 "Tool choice policy: none.",
-                "Do not call any tool. Answer with normal text only.",
+                "Do not emit any executable tool markup. Answer with normal text only.",
             ]
         )
     elif mode == "required":
@@ -219,8 +230,8 @@ def tools_to_prompt(
         )
 
     parts = [
-        "# TOOLS",
-        "You must treat the following tool schemas as authoritative.",
+        "# TOOL SCHEMAS",
+        "Treat the following schema list as the authoritative tool contract for this request.",
         "",
         "\n\n".join(tool_schemas),
         "",

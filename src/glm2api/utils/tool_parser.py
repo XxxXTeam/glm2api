@@ -8,8 +8,22 @@ from dataclasses import dataclass, field
 
 
 CODE_FENCE_PATTERN = re.compile(r"```[\s\S]*?```")
+WRAPPER_TAGS = {"tool_calls"}
+EXECUTABLE_TOOL_TAGS = {
+    "tool_call",
+    "function_call",
+    "tool_use",
+    "invoke",
+    "function",
+    "attempt_completion",
+    "ask_followup_question",
+    "new_task",
+    "result",
+}
+PARAMETER_CONTAINER_TAGS = ("parameters", "arguments", "input")
+PARAMETER_ITEM_TAGS = {"parameter", "argument"}
 START_TAG_PATTERN = re.compile(
-    r"<(?P<tag>tool_calls|tool_call|function_call|tool_use|invoke|antml:function_call|antml:invoke)\b(?P<attrs>[^>]*)/?>",
+    r"<(?P<tag>tool_calls|tool_call|function_call|tool_use|invoke|function|attempt_completion|ask_followup_question|new_task|result|antml:function_call|antml:invoke)\b(?P<attrs>[^>]*)/?>",
     re.IGNORECASE,
 )
 TOOL_RESULT_PATTERN = re.compile(r"<tool_result\b[\s\S]*?</tool_result>", re.IGNORECASE)
@@ -142,6 +156,9 @@ def _extract_name(element: ET.Element) -> str:
     attr_name = element.attrib.get("name", "").strip()
     if attr_name:
         return attr_name
+    local_tag = _local_name(element.tag)
+    if local_tag in {"attempt_completion", "ask_followup_question", "new_task", "result"}:
+        return local_tag
     for tag_name in ("tool_name", "name"):
         child = element.find(tag_name)
         if child is not None:
@@ -152,6 +169,12 @@ def _extract_name(element: ET.Element) -> str:
         function_child = element.find("function")
         if function_child is not None:
             nested_name = function_child.attrib.get("name", "").strip()
+            if nested_name:
+                return nested_name
+    if local_tag == "function":
+        name_child = element.find("name")
+        if name_child is not None:
+            nested_name = _leaf_text(name_child)
             if nested_name:
                 return nested_name
     if _local_name(element.tag) == "function_call":
@@ -173,7 +196,7 @@ def _extract_arguments(element: ET.Element) -> dict[str, object]:
     if parsed_text is not None:
         return parsed_text
 
-    for tag_name in ("parameters", "arguments", "input"):
+    for tag_name in PARAMETER_CONTAINER_TAGS:
         child = element.find(tag_name)
         if child is not None:
             value = _xml_value_to_object(child)
@@ -186,11 +209,16 @@ def _extract_arguments(element: ET.Element) -> dict[str, object]:
             if isinstance(nested_value, dict):
                 nested_value.pop("name", None)
                 return nested_value
+    if _local_name(element.tag) == "function":
+        function_value = _xml_value_to_object(element)
+        if isinstance(function_value, dict):
+            function_value.pop("name", None)
+            return function_value
 
     parameter_like_children = [
         child
         for child in list(element)
-        if isinstance(child.tag, str) and _local_name(child.tag) in {"parameter", "argument"} and child.attrib.get("name")
+        if isinstance(child.tag, str) and _local_name(child.tag) in PARAMETER_ITEM_TAGS and child.attrib.get("name")
     ]
     if parameter_like_children:
         result: dict[str, object] = {}
@@ -230,7 +258,7 @@ def _parse_xml_block(block: str, allowed_tool_names: set[str] | None, start_inde
 
     candidates: list[ET.Element]
     root_name = _local_name(root.tag)
-    if root_name == "tool_calls":
+    if root_name in WRAPPER_TAGS:
         candidates = [child for child in list(root) if isinstance(child.tag, str)]
     else:
         candidates = [root]
@@ -238,7 +266,7 @@ def _parse_xml_block(block: str, allowed_tool_names: set[str] | None, start_inde
     tool_calls: list[dict[str, object]] = []
     for candidate in candidates:
         candidate_name = _local_name(candidate.tag)
-        if candidate_name not in {"tool_call", "function_call", "tool_use", "invoke", "function_call"}:
+        if candidate_name not in EXECUTABLE_TOOL_TAGS:
             continue
         tool_name = _extract_name(candidate)
         if not tool_name:
