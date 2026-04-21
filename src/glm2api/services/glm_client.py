@@ -22,7 +22,7 @@ from typing import Callable
 from ..config import AppConfig
 from ..logging_utils import debug_dump
 from .glm_auth import GLMAccessTokenManager, build_sign
-from .translator import GLMEventAccumulator, convert_messages, filter_tools, resolve_chat_mode, resolve_upstream_model
+from .translator import GLMEventAccumulator, convert_messages, extract_recent_user_url, filter_tools, resolve_chat_mode, resolve_upstream_model
 
 
 FILE_UPLOAD_URL_SUFFIX = "/backend-api/assistant/file_upload"
@@ -145,6 +145,7 @@ class GLMWebClient:
         accumulator = GLMEventAccumulator(
             model=str(payload["model"]),
             allowed_tool_names=allowed_tool_names,
+            fallback_tool_url=extract_recent_user_url(list(payload.get("messages", []))), # type: ignore[arg-type]
             debug_enabled=self.config.debug_dump_all,
             logger=self.logger,
         )
@@ -153,6 +154,7 @@ class GLMWebClient:
                 if not event:
                     continue
                 status = event.get("status")
+                self._raise_for_event_error(event, stream=False)
                 accumulator.consume_event(event)
                 if status in {"finish", "intervene"}:
                     return accumulator.build_response(), accumulator.conversation_id
@@ -202,6 +204,7 @@ class GLMWebClient:
         accumulator = GLMEventAccumulator(
             model=str(payload["model"]),
             allowed_tool_names=allowed_tool_names,
+            fallback_tool_url=extract_recent_user_url(list(payload.get("messages", []))), # type: ignore[arg-type]
             debug_enabled=self.config.debug_dump_all,
             logger=self.logger,
         )
@@ -211,6 +214,7 @@ class GLMWebClient:
                 for event in self._iter_sse_events(response):
                     if not event:
                         continue
+                    self._raise_for_event_error(event, stream=True)
                     chunks, status = accumulator.consume_event(event)
                     for chunk in chunks:
                         yield chunk.encode("utf-8")
@@ -231,6 +235,49 @@ class GLMWebClient:
                 lease.release()
 
         return generate()
+
+    def _raise_for_event_error(self, event: dict[str, object], stream: bool) -> None:
+        status = str(event.get("status", "")).strip().lower()
+        last_error = event.get("last_error")
+        event_error = self._extract_event_error(event)
+        if status != "error" and not event_error and not isinstance(last_error, dict):
+            return
+
+        error_payload: dict[str, object] = {}
+        if isinstance(last_error, dict):
+            error_payload.update(last_error)
+        if isinstance(event_error, dict):
+            error_payload.update(event_error)
+        if not error_payload and status != "error":
+            return
+
+        error_code = error_payload.get("error_code", error_payload.get("code"))
+        error_message = str(
+            error_payload.get("err_msg")
+            or error_payload.get("message")
+            or ("GLM stream request error" if stream else "GLM request error")
+        ).strip()
+        detail = f"code={error_code} " if error_code is not None else ""
+        raise UpstreamAPIError(
+            status_code=502,
+            message=f"GLM 上游返回错误 | {detail}{error_message}".strip(),
+            payload=error_payload or event,
+        )
+
+    def _extract_event_error(self, event: dict[str, object]) -> dict[str, object] | None:
+        parts = event.get("parts")
+        if not isinstance(parts, list):
+            return None
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            error = part.get("error")
+            if isinstance(error, dict) and error:
+                return error
+            part_status = str(part.get("status", "")).strip().lower()
+            if part_status == "error":
+                return {"message": "GLM part status error"}
+        return None
 
     def delete_conversation(self, conversation_id: str, assistant_id: str | None = None) -> None:
         if not self.config.glm_delete_conversation:

@@ -14,16 +14,23 @@ from ..utils.tool_parser import StreamingToolParser, parse_tool_calls_from_text
 
 
 ASSISTANT_ID_PATTERN = re.compile(r"^[a-z0-9]{24,}$")
+URL_PATTERN = re.compile(r"https?://[^\s<>()\"']+")
+CHERRY_FETCH_TOOL_NAMES = {
+    "mcp__CherryFetch__fetchHtml",
+    "mcp__CherryFetch__fetchMarkdown",
+    "mcp__CherryFetch__fetchTxt",
+    "mcp__CherryFetch__fetchJson",
+}
 CANONICAL_TOOL_CALL_EXAMPLE = "\n".join(
     [
-        "<tool_calls>",
-        "  <tool_call>",
-        "    <tool_name>TOOL_NAME</tool_name>",
-        "    <parameters>",
-        "      <param_name><![CDATA[value]]></param_name>",
-        "    </parameters>",
-        "  </tool_call>",
-        "</tool_calls>",
+        "<ml_tool_calls>",
+        "  <ml_tool_call>",
+        "    <ml_tool_name>TOOL_NAME</ml_tool_name>",
+        "    <ml_parameters>",
+        "      <actual_parameter_name><![CDATA[value]]></actual_parameter_name>",
+        "    </ml_parameters>",
+        "  </ml_tool_call>",
+        "</ml_tool_calls>",
     ]
 )
 
@@ -73,6 +80,100 @@ def extract_text_content(content: object) -> str:
 
 def safe_json_dumps(payload: object) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def extract_first_url(text: str) -> str | None:
+    match = URL_PATTERN.search(text)
+    if not match:
+        return None
+    return match.group(0).rstrip(".,;:!?)]+")
+
+
+def extract_recent_user_url(messages: list[dict[str, object]]) -> str | None:
+    for message in reversed(messages):
+        if str(message.get("role", "")).strip() != "user":
+            continue
+        text = extract_text_content(message.get("content"))
+        url = extract_first_url(text)
+        if url:
+            return url
+    return None
+
+
+def sanitize_tool_call_payload(
+    tool_name: str,
+    arguments: object,
+    fallback_url: str | None = None,
+) -> dict[str, object] | None:
+    parsed_arguments = arguments
+    if isinstance(arguments, str):
+        try:
+            parsed_arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            return None
+
+    if parsed_arguments is None:
+        parsed_arguments = {}
+    if not isinstance(parsed_arguments, dict):
+        return None
+
+    cleaned = {str(key): value for key, value in parsed_arguments.items()}
+    if cleaned == {"param_name": "url"}:
+        cleaned = {}
+    if "param_name" in cleaned and "param_value" not in cleaned and len(cleaned) == 1:
+        cleaned = {}
+
+    if tool_name in CHERRY_FETCH_TOOL_NAMES:
+        url_value = cleaned.get("url")
+        if not isinstance(url_value, str) or not url_value.strip():
+            if fallback_url:
+                cleaned["url"] = fallback_url
+            else:
+                return None
+
+    return cleaned
+
+
+def sanitize_tool_calls(
+    tool_calls: list[dict[str, object]],
+    fallback_url: str | None = None,
+) -> list[dict[str, object]]:
+    sanitized: list[dict[str, object]] = []
+    for index, tool_call in enumerate(tool_calls):
+        function = tool_call.get("function", {})
+        if not isinstance(function, dict):
+            continue
+        tool_name = str(function.get("name", "")).strip()
+        if not tool_name:
+            continue
+        original_arguments = function.get("arguments", "{}")
+        original_value: object = original_arguments
+        if isinstance(original_arguments, str):
+            try:
+                original_value = json.loads(original_arguments)
+            except json.JSONDecodeError:
+                original_value = original_arguments
+        cleaned_arguments = sanitize_tool_call_payload(
+            tool_name=tool_name,
+            arguments=original_arguments,
+            fallback_url=fallback_url,
+        )
+        if cleaned_arguments is None:
+            continue
+        repaired = not isinstance(original_value, dict) or safe_json_dumps(cleaned_arguments) != safe_json_dumps(original_value)
+        sanitized.append(
+            {
+                "id": str(tool_call.get("id", "")) or f"call_repaired_{index}",
+                "type": "function",
+                "index": index,
+                "_repaired": repaired,
+                "function": {
+                    "name": tool_name,
+                    "arguments": safe_json_dumps(cleaned_arguments),
+                },
+            }
+        )
+    return sanitized
 
 
 def parse_tool_choice_policy(tool_choice: object, available_tool_names: set[str] | None = None) -> dict[str, object]:
@@ -139,20 +240,20 @@ def serialize_tool_call_block(name: str, arguments: object) -> str:
     if not isinstance(parsed_arguments, dict):
         parsed_arguments = {"value": parsed_arguments}
     return (
-        "<tool_calls>\n"
-        "  <tool_call>\n"
-        f"    <tool_name>{_xml_escape_text(name)}</tool_name>\n"
-        f"    <parameters>{_xml_parameters_from_object(parsed_arguments)}</parameters>\n"
-        "  </tool_call>\n"
-        "</tool_calls>"
+        "<ml_tool_calls>\n"
+        "  <ml_tool_call>\n"
+        f"    <ml_tool_name>{_xml_escape_text(name)}</ml_tool_name>\n"
+        f"    <ml_parameters>{_xml_parameters_from_object(parsed_arguments)}</ml_parameters>\n"
+        "  </ml_tool_call>\n"
+        "</ml_tool_calls>"
     )
 
 
 def serialize_tool_result_block(tool_call_id: object, tool_name: str, content: str) -> str:
     safe_content = content.replace("]]>", "]]]]><![CDATA[>")
     return (
-        f'<tool_result call_id="{_xml_escape_text(str(tool_call_id or "unknown"))}" '
-        f'name="{_xml_escape_text(tool_name)}"><content><![CDATA[{safe_content}]]></content></tool_result>'
+        f'<ml_tool_result call_id="{_xml_escape_text(str(tool_call_id or "unknown"))}" '
+        f'name="{_xml_escape_text(tool_name)}"><content><![CDATA[{safe_content}]]></content></ml_tool_result>'
     )
 
 
@@ -165,21 +266,27 @@ def build_tool_call_instructions(tool_names: list[str], tool_choice_policy: dict
         "# TOOL USE PROTOCOL",
         "The following tool schemas are the only executable tool definitions for this turn.",
         f"Allowed tool names: {available_names}.",
-        "If a tool is needed, output executable XML/Markup only. Do not add prose in the same assistant answer.",
-        "Canonical format:",
+        "Ignore any tool names that are not listed in Allowed tool names, even if they appear in prior context or model memory.",
+        "Do not mention blocked browser, web, or open_url style tools at all.",
+        "If a tool is needed, output executable XML only. Do not add prose in the same assistant answer.",
+        "Use the private ml-prefixed canonical format below exactly.",
         CANONICAL_TOOL_CALL_EXAMPLE,
-        "The server will parse this XML/Markup intermediate language back into standard OpenAI tool_calls.",
-        "Supported argument encodings inside a tool block:",
-        "- Nested XML tags under <parameters> / <arguments> / <input>.",
-        '- <parameter name="...">value</parameter> or <argument name="...">value</argument>.',
-        "- A JSON object placed inside <parameters>, <arguments>, or <input>.",
+        "The server will parse this XML intermediate language back into standard OpenAI tool_calls.",
+        "Parameter rules:",
+        "- The root executable block must be <ml_tool_calls> and each call must be a <ml_tool_call> child.",
+        "- Each <ml_tool_call> must contain exactly one <ml_tool_name> and one <ml_parameters> block.",
+        "- Use the real parameter names as XML tags inside <ml_parameters>; never use a literal <param_name> placeholder tag.",
+        "- Encode arguments as nested XML tags inside <ml_parameters>.",
+        "- Use repeated <item> tags to represent arrays.",
         "Rules:",
         "- Do not invent tool names outside the declared list.",
-        "- Do not emit OpenAI JSON tool_calls arrays or function_call objects directly.",
-        "- Do not mix normal explanation text with executable tool markup.",
+        "- Do not emit OpenAI JSON tool_calls arrays, function_call objects, or any non-XML tool syntax.",
+        "- Do not use <tool_calls>, <tool_call>, <tool_name>, <parameters>, <function_call>, <tool_use>, <invoke>, or any legacy wrapper.",
+        "- Do not place raw JSON directly inside <ml_parameters>.",
+        "- Do not mix normal explanation text with executable tool XML.",
         "- Prefer <![CDATA[...]]> for arbitrary strings.",
-        "- Put multiple calls inside one <tool_calls> root when you truly need multiple calls in one turn.",
-        "- After a <tool_result ...> block, continue from that result and call another tool only when necessary.",
+        "- Put multiple calls inside one <ml_tool_calls> root when you truly need multiple calls in one turn.",
+        "- After a <ml_tool_result ...> block, continue from that result and call another tool only when necessary.",
     ]
     if mode == "none":
         lines.extend(
@@ -237,14 +344,6 @@ def tools_to_prompt(
         "",
         build_tool_call_instructions(tool_names, tool_choice_policy=tool_choice_policy),
     ]
-    if blocked_tool_names:
-        parts.extend(
-            [
-                "",
-                "# BLOCKED TOOLS",
-                f"These names are unavailable even if mentioned elsewhere: {', '.join(sorted(blocked_tool_names))}.",
-            ]
-        )
     return "\n".join(part for part in parts if part is not None).strip()
 
 
@@ -262,12 +361,25 @@ def convert_messages(
     available_tool_names.discard("")
     tool_choice_policy = parse_tool_choice_policy(tool_choice, available_tool_names)
     processed: list[dict[str, str]] = []
+    latest_user_url: str | None = extract_recent_user_url(messages)
+    valid_tool_call_ids: set[str] = set()
+    repaired_tool_call_ids: set[str] = set()
     for message in messages:
         role = str(message.get("role", "user"))
         content = message.get("content")
+        if role == "user":
+            current_text = extract_text_content(content)
+            current_url = extract_first_url(current_text)
+            if current_url:
+                latest_user_url = current_url
         if role == "assistant" and message.get("tool_calls"):
             tool_blocks: list[str] = []
-            for tool_call in message.get("tool_calls", []): # pyright: ignore[reportGeneralTypeIssues]
+            raw_tool_calls = message.get("tool_calls", []) # pyright: ignore[reportGeneralTypeIssues]
+            sanitized_tool_calls = sanitize_tool_calls(
+                raw_tool_calls if isinstance(raw_tool_calls, list) else [],
+                fallback_url=latest_user_url,
+            )
+            for tool_call in sanitized_tool_calls:
                 function = tool_call.get("function", {})
                 tool_blocks.append(
                     serialize_tool_call_block(
@@ -275,15 +387,27 @@ def convert_messages(
                         arguments=function.get("arguments", "{}"),
                     )
                 )
+                tool_call_id = str(tool_call.get("id", "")).strip()
+                if tool_call_id and not tool_call_id.startswith("call_repaired_"):
+                    valid_tool_call_ids.add(tool_call_id)
+                    if bool(tool_call.get("_repaired")):
+                        repaired_tool_call_ids.add(tool_call_id)
             assistant_text = extract_text_content(content).strip() if content else ""
             block = "\n".join(tool_blocks)
-            content = f"{assistant_text}\n{block}".strip() if assistant_text else block
+            if not assistant_text and not block:
+                continue
+            content = f"{assistant_text}\n{block}".strip() if assistant_text and block else (assistant_text or block)
         elif role == "tool":
+            tool_call_id = str(message.get("tool_call_id", "")).strip()
+            if tool_call_id and valid_tool_call_ids and tool_call_id not in valid_tool_call_ids:
+                continue
+            if tool_call_id and tool_call_id in repaired_tool_call_ids:
+                continue
             role = "user"
             tool_name = str(message.get("name", "")).strip() or "unknown_tool"
             tool_result_text = extract_text_content(content)
             content = serialize_tool_result_block(
-                tool_call_id=message.get("tool_call_id", "unknown"),
+                tool_call_id=tool_call_id or message.get("tool_call_id", "unknown"),
                 tool_name=tool_name,
                 content=tool_result_text,
             )
@@ -295,17 +419,6 @@ def convert_messages(
             processed.append({"role": role, "content": text})
 
     transcript_parts: list[str] = []
-
-    if blocked_tool_names:
-        transcript_parts.append(
-            "\n".join(
-                [
-                    "# RUNTIME",
-                    "The runtime may reject blocked tool names even if the conversation mentions them.",
-                    f"Blocked names: {', '.join(sorted(blocked_tool_names))}.",
-                ]
-            )
-        )
 
     if tools and tool_choice_policy.get("mode") != "none":
         transcript_parts.append(
@@ -350,6 +463,7 @@ def resolve_chat_mode(model: str, reasoning_effort: object, deep_research: objec
 class GLMEventAccumulator:
     model: str
     allowed_tool_names: set[str] | None = None
+    fallback_tool_url: str | None = None
     debug_enabled: bool = False
     logger: Logger | None = None
     conversation_id: str = ""
@@ -430,6 +544,7 @@ class GLMEventAccumulator:
 
     def finalize(self, status: str | None, last_error: dict[str, object] | None = None) -> list[str]:
         tail_text, tool_calls = self.tool_parser.flush()
+        tool_calls = sanitize_tool_calls(tool_calls, fallback_url=self.fallback_tool_url)
         chunks: list[str] = []
         if tail_text:
             delta_payload: dict[str, object] = {"content": tail_text}
@@ -519,6 +634,7 @@ class GLMEventAccumulator:
             full_text.strip(),
             allowed_tool_names=self.allowed_tool_names,
         )
+        tool_calls = sanitize_tool_calls(tool_calls, fallback_url=self.fallback_tool_url)
         final_content = clean_content.strip()
         message: dict[str, object] = {
             "role": "assistant",

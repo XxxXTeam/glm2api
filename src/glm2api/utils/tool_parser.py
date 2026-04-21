@@ -8,36 +8,40 @@ from dataclasses import dataclass, field
 
 
 CODE_FENCE_PATTERN = re.compile(r"```[\s\S]*?```")
-WRAPPER_TAGS = {"tool_calls"}
-EXECUTABLE_TOOL_TAGS = {
-    "tool_call",
-    "function_call",
-    "tool_use",
-    "invoke",
-    "function",
-    "attempt_completion",
-    "ask_followup_question",
-    "new_task",
-    "result",
-}
-PARAMETER_CONTAINER_TAGS = ("parameters", "arguments", "input")
-PARAMETER_ITEM_TAGS = {"parameter", "argument"}
-START_TAG_PATTERN = re.compile(
-    r"<(?P<tag>tool_calls|tool_call|function_call|tool_use|invoke|function|attempt_completion|ask_followup_question|new_task|result|antml:function_call|antml:invoke)\b(?P<attrs>[^>]*)/?>",
-    re.IGNORECASE,
+TOOL_RESULT_PATTERN = re.compile(r"<(?:ml_)?tool_result\b[\s\S]*?</(?:ml_)?tool_result>", re.IGNORECASE)
+START_TAG_PATTERN = re.compile(r"<(?P<tag>(?:ml_)?tool_calls|(?:ml_)?tool_call)\b[^>]*>", re.IGNORECASE)
+PARAM_NAME_TAG_PATTERN = re.compile(r"<param_name>\s*(.*?)\s*</param_name>", re.IGNORECASE | re.DOTALL)
+PARAM_VALUE_TAG_PATTERN = re.compile(r"<param_value>\s*(.*?)\s*</param_value>", re.IGNORECASE | re.DOTALL)
+TOOL_CHATTER_PATTERN = re.compile(
+    r"(?is)"
+    r"(?:the\s+open_url\s+tool\s+is\s+not\s+available.*?|"
+    r"let\s+me\s+use\s+the\s+correct.*?|"
+    r"i\s+apologize\s+for\s+the\s+repeated.*?|"
+    r"the\s+tool\s+open_url\s+appears\s+to\s+be\s+blocked.*?|"
+    r"open_url工具被阻止.*?|"
+    r"让我改用.*?工具.*?|"
+    r"非常抱歉.*?|"
+    r"我无法继续尝试.*?|"
+    r"总结问题[:：].*?)(?=<(?:ml_)?tool_calls\b|$)"
 )
-TOOL_RESULT_PATTERN = re.compile(r"<tool_result\b[\s\S]*?</tool_result>", re.IGNORECASE)
 TAG_NAME_HINTS = [
-    "<tool",
-    "</tool",
-    "<function_call",
-    "</function_call",
-    "<invoke",
-    "</invoke",
-    "<antml:",
-    "</antml:",
+    "<m",
+    "</m",
+    "<ml_",
+    "</ml_",
+    "<ml_tool_calls",
+    "</ml_tool_calls",
+    "<ml_tool_call",
+    "</ml_tool_call",
+    "<ml_tool_name",
+    "</ml_tool_name",
+    "<ml_parameters",
+    "</ml_parameters",
+    "<ml_tool_result",
+    "</ml_tool_result",
+    "<tool_calls",
+    "</tool_calls",
 ]
-TAIL_GUARD = 96
 
 
 def _local_name(tag: str) -> str:
@@ -45,13 +49,7 @@ def _local_name(tag: str) -> str:
         tag = tag.split("}", 1)[1]
     if ":" in tag:
         tag = tag.split(":", 1)[1]
-    if tag.startswith("antml_"):
-        tag = tag.split("_", 1)[1]
     return tag.lower()
-
-
-def _sanitize_xml_markup(block: str) -> str:
-    return block.replace("antml:", "antml_")
 
 
 def _balanced_text(value: str) -> str:
@@ -60,40 +58,6 @@ def _balanced_text(value: str) -> str:
 
 def _leaf_text(element: ET.Element) -> str:
     return _balanced_text("".join(element.itertext()))
-
-
-def _maybe_parse_json_object(text: str) -> dict[str, object] | None:
-    stripped = text.strip()
-    if not stripped:
-        return {}
-    if stripped[0] not in "{[":
-        return None
-    try:
-        parsed = json.loads(stripped)
-    except json.JSONDecodeError:
-        return None
-    if isinstance(parsed, dict):
-        return parsed
-    return None
-
-
-def _extract_json_tool_payload(text: str) -> tuple[str, dict[str, object]] | None:
-    parsed = _maybe_parse_json_object(text)
-    if not parsed:
-        return None
-    name = str(parsed.get("tool") or parsed.get("name") or parsed.get("tool_name") or "").strip()
-    if not name:
-        return None
-    arguments = parsed.get("params")
-    if arguments is None:
-        arguments = parsed.get("parameters")
-    if arguments is None:
-        arguments = parsed.get("arguments")
-    if arguments is None:
-        arguments = parsed.get("input")
-    if isinstance(arguments, dict):
-        return name, arguments
-    return name, {}
 
 
 def _coerce_leaf_value(text: str) -> object:
@@ -138,12 +102,9 @@ def _xml_value_to_object(element: ET.Element) -> object:
     if not children:
         return _coerce_leaf_value(_leaf_text(element))
 
-    named_children = all(_local_name(child.tag) in {"parameter", "argument"} and child.attrib.get("name") for child in children)
-    if named_children:
-        result: dict[str, object] = {}
-        for child in children:
-            _append_value(result, child.attrib["name"].strip(), _xml_value_to_object(child))
-        return result
+    repeated_item_only = all(_local_name(child.tag) == "item" for child in children)
+    if repeated_item_only:
+        return [_xml_value_to_object(child) for child in children]
 
     result: dict[str, object] = {}
     for child in children:
@@ -152,90 +113,23 @@ def _xml_value_to_object(element: ET.Element) -> object:
     return result
 
 
-def _extract_name(element: ET.Element) -> str:
-    attr_name = element.attrib.get("name", "").strip()
-    if attr_name:
-        return attr_name
-    local_tag = _local_name(element.tag)
-    if local_tag in {"attempt_completion", "ask_followup_question", "new_task", "result"}:
-        return local_tag
-    for tag_name in ("tool_name", "name"):
-        child = element.find(tag_name)
-        if child is not None:
-            text = _leaf_text(child)
-            if text:
-                return text
-    if _local_name(element.tag) == "tool_use":
-        function_child = element.find("function")
-        if function_child is not None:
-            nested_name = function_child.attrib.get("name", "").strip()
-            if nested_name:
-                return nested_name
-    if local_tag == "function":
-        name_child = element.find("name")
-        if name_child is not None:
-            nested_name = _leaf_text(name_child)
-            if nested_name:
-                return nested_name
-    if _local_name(element.tag) == "function_call":
-        text_name = _leaf_text(element)
-        if text_name and not _maybe_parse_json_object(text_name):
-            return text_name
-    json_payload = _extract_json_tool_payload(_leaf_text(element))
-    if json_payload is not None:
-        return json_payload[0]
+def _extract_tool_name(element: ET.Element) -> str:
+    for tag_name in ("ml_tool_name", "tool_name"):
+        tool_name_element = element.find(tag_name)
+        if tool_name_element is not None:
+            return _leaf_text(tool_name_element)
     return ""
 
 
-def _extract_arguments(element: ET.Element) -> dict[str, object]:
-    direct_text = _leaf_text(element)
-    json_tool_payload = _extract_json_tool_payload(direct_text)
-    if json_tool_payload is not None:
-        return json_tool_payload[1]
-    parsed_text = _maybe_parse_json_object(direct_text)
-    if parsed_text is not None:
-        return parsed_text
-
-    for tag_name in PARAMETER_CONTAINER_TAGS:
-        child = element.find(tag_name)
-        if child is not None:
-            value = _xml_value_to_object(child)
-            if isinstance(value, dict):
-                return value
-    if _local_name(element.tag) == "tool_use":
-        function_child = element.find("function")
-        if function_child is not None:
-            nested_value = _xml_value_to_object(function_child)
-            if isinstance(nested_value, dict):
-                nested_value.pop("name", None)
-                return nested_value
-    if _local_name(element.tag) == "function":
-        function_value = _xml_value_to_object(element)
-        if isinstance(function_value, dict):
-            function_value.pop("name", None)
-            return function_value
-
-    parameter_like_children = [
-        child
-        for child in list(element)
-        if isinstance(child.tag, str) and _local_name(child.tag) in PARAMETER_ITEM_TAGS and child.attrib.get("name")
-    ]
-    if parameter_like_children:
-        result: dict[str, object] = {}
-        for child in parameter_like_children:
-            _append_value(result, child.attrib["name"].strip(), _xml_value_to_object(child))
-        return result
-
-    result: dict[str, object] = {}
-    for child in list(element):
-        if not isinstance(child.tag, str):
-            continue
-        key = _local_name(child.tag)
-        if key in {"tool_name", "name"}:
-            continue
-        value = _xml_value_to_object(child)
-        _append_value(result, key, value)
-    return result
+def _extract_arguments(element: ET.Element) -> dict[str, object] | None:
+    for tag_name in ("ml_parameters", "parameters"):
+        parameters_element = element.find(tag_name)
+        if parameters_element is not None:
+            parsed = _xml_value_to_object(parameters_element)
+            if isinstance(parsed, dict):
+                return parsed
+            return {"value": parsed}
+    return None
 
 
 def _build_tool_call(name: str, arguments: dict[str, object], index: int) -> dict[str, object]:
@@ -250,31 +144,103 @@ def _build_tool_call(name: str, arguments: dict[str, object], index: int) -> dic
     }
 
 
-def _parse_xml_block(block: str, allowed_tool_names: set[str] | None, start_index: int) -> tuple[list[dict[str, object]], tuple[int, int] | None]:
+def _parse_tool_call_element(
+    element: ET.Element,
+    allowed_tool_names: set[str] | None,
+    index: int,
+) -> dict[str, object] | None:
+    if _local_name(element.tag) not in {"tool_call", "ml_tool_call"}:
+        return None
+
+    tool_name = _extract_tool_name(element)
+    if not tool_name:
+        return None
+    if allowed_tool_names is not None and tool_name not in allowed_tool_names:
+        return None
+
+    arguments = _extract_arguments(element)
+    if arguments is None:
+        return None
+
+    return _build_tool_call(tool_name, arguments, index)
+
+
+def _extract_malformed_tool_call_from_root(
+    root: ET.Element,
+    allowed_tool_names: set[str] | None,
+    index: int,
+) -> dict[str, object] | None:
+    root_name = _local_name(root.tag)
+    if root_name not in {"tool_calls", "ml_tool_calls"}:
+        return None
+
+    tool_name = _extract_tool_name(root)
+    if not tool_name:
+        return None
+    if allowed_tool_names is not None and tool_name not in allowed_tool_names:
+        return None
+
+    for tag_name in ("ml_parameters", "parameters"):
+        parameters_element = root.find(tag_name)
+        if parameters_element is not None:
+            parsed = _xml_value_to_object(parameters_element)
+            arguments = parsed if isinstance(parsed, dict) else {"value": parsed}
+            return _build_tool_call(tool_name, arguments, index)
+
+    names = [match.group(1).strip() for match in PARAM_NAME_TAG_PATTERN.finditer(ET.tostring(root, encoding="unicode"))]
+    values = [match.group(1).strip() for match in PARAM_VALUE_TAG_PATTERN.finditer(ET.tostring(root, encoding="unicode"))]
+    if names and values and len(names) == len(values):
+        arguments = {
+            key: _coerce_leaf_value(value)
+            for key, value in zip(names, values, strict=False)
+            if key
+        }
+        return _build_tool_call(tool_name, arguments, index)
+    if names and not values:
+        return None
+
+    direct_pairs: dict[str, object] = {}
+    children = [child for child in list(root) if isinstance(child.tag, str)]
+    for child in children:
+        key = _local_name(child.tag)
+        if key in {"tool_name", "ml_tool_name", "tool_call", "ml_tool_call"}:
+            continue
+        if key in {"param_name", "param_value"}:
+            continue
+        direct_pairs[key] = _xml_value_to_object(child)
+    if direct_pairs:
+        return _build_tool_call(tool_name, direct_pairs, index)
+    return None
+
+
+def _parse_xml_block(
+    block: str,
+    allowed_tool_names: set[str] | None,
+    start_index: int,
+) -> tuple[list[dict[str, object]], tuple[int, int] | None]:
     try:
-        root = ET.fromstring(_sanitize_xml_markup(block))
+        root = ET.fromstring(block)
     except ET.ParseError:
         return [], None
 
-    candidates: list[ET.Element]
     root_name = _local_name(root.tag)
-    if root_name in WRAPPER_TAGS:
+    if root_name in {"tool_calls", "ml_tool_calls"}:
         candidates = [child for child in list(root) if isinstance(child.tag, str)]
-    else:
+    elif root_name in {"tool_call", "ml_tool_call"}:
         candidates = [root]
+    else:
+        return [], None
 
     tool_calls: list[dict[str, object]] = []
     for candidate in candidates:
-        candidate_name = _local_name(candidate.tag)
-        if candidate_name not in EXECUTABLE_TOOL_TAGS:
-            continue
-        tool_name = _extract_name(candidate)
-        if not tool_name:
-            continue
-        if allowed_tool_names is not None and tool_name not in allowed_tool_names:
-            continue
-        arguments = _extract_arguments(candidate)
-        tool_calls.append(_build_tool_call(tool_name, arguments, len(tool_calls)))
+        parsed = _parse_tool_call_element(candidate, allowed_tool_names, len(tool_calls))
+        if parsed is not None:
+            tool_calls.append(parsed)
+
+    if not tool_calls:
+        malformed = _extract_malformed_tool_call_from_root(root, allowed_tool_names, 0)
+        if malformed is not None:
+            tool_calls.append(malformed)
 
     if not tool_calls:
         return [], None
@@ -290,18 +256,8 @@ def _mask_code_fences(text: str) -> str:
 
 
 def _find_matching_block(masked_text: str, start_match: re.Match[str]) -> tuple[int, int] | None:
-    tag_name = start_match.group("tag")
-    raw_text = start_match.group(0)
-    if raw_text.rstrip().endswith("/>"):
-        return start_match.start(), start_match.end()
-
-    if tag_name.lower() == "invoke":
-        closing_pattern = re.compile(r"</invoke\s*>", re.IGNORECASE)
-    elif tag_name.lower() == "antml:invoke":
-        closing_pattern = re.compile(r"</antml:invoke\s*>", re.IGNORECASE)
-    else:
-        closing_pattern = re.compile(rf"</{re.escape(tag_name)}\s*>", re.IGNORECASE)
-
+    tag_name = start_match.group("tag").lower()
+    closing_pattern = re.compile(rf"</{re.escape(tag_name)}\s*>", re.IGNORECASE)
     closing_match = closing_pattern.search(masked_text, start_match.end())
     if closing_match is None:
         return None
@@ -331,66 +287,23 @@ def _extract_tool_blocks(text: str, allowed_tool_names: set[str] | None) -> tupl
             tool_calls.extend(block_calls)
             cursor = end
             continue
+        if match.group("tag").lower().startswith("ml_"):
+            spans.append((start, end))
+            cursor = end
+            continue
 
         cursor = match.end()
 
     return spans, tool_calls
 
 
-FUNCTION_PARAMETER_BLOCK_PATTERN = re.compile(
-    r"(?P<prefix><function_call>\s*(?P<name>[^<\s][\s\S]*?)\s*</function_call>)"
-    r"(?P<params>(?:\s*<function\s+parameter\s+name=\"(?P<param_name>[^\"]+)\">[\s\S]*?</function\s+parameter>)+)",
-    re.IGNORECASE,
-)
-FUNCTION_PARAMETER_ITEM_PATTERN = re.compile(
-    r"<function\s+parameter\s+name=\"(?P<name>[^\"]+)\">(?P<value>[\s\S]*?)</function\s+parameter>",
-    re.IGNORECASE,
-)
-
-
-def _parse_function_parameter_markup(text: str, allowed_tool_names: set[str] | None) -> tuple[list[tuple[int, int]], list[dict[str, object]]]:
-    spans: list[tuple[int, int]] = []
-    tool_calls: list[dict[str, object]] = []
-    masked = _mask_code_fences(text)
-    for match in FUNCTION_PARAMETER_BLOCK_PATTERN.finditer(masked):
-        original = text[match.start():match.end()]
-        if "```" in original:
-            continue
-        tool_name = _balanced_text(match.group("name"))
-        if not tool_name:
-            continue
-        if allowed_tool_names is not None and tool_name not in allowed_tool_names:
-            continue
-        arguments: dict[str, object] = {}
-        for item in FUNCTION_PARAMETER_ITEM_PATTERN.finditer(text[match.start():match.end()]):
-            arguments[item.group("name").strip()] = _coerce_leaf_value(item.group("value"))
-        spans.append((match.start(), match.end()))
-        tool_calls.append(_build_tool_call(tool_name, arguments, len(tool_calls)))
-    return spans, tool_calls
-
-
-def _merge_tool_parse_results(
-    primary_spans: list[tuple[int, int]],
-    primary_calls: list[dict[str, object]],
-    extra_spans: list[tuple[int, int]],
-    extra_calls: list[dict[str, object]],
-) -> tuple[list[tuple[int, int]], list[dict[str, object]]]:
-    spans = list(primary_spans)
-    calls = list(primary_calls)
-    for span, call in zip(extra_spans, extra_calls):
-        start, end = span
-        if any(not (end <= existing_start or start >= existing_end) for existing_start, existing_end in spans):
-            continue
-        call["index"] = len(calls)
-        spans.append(span)
-        calls.append(call)
-    spans.sort(key=lambda item: item[0])
-    return spans, calls
-
-
 def _remove_spans(text: str, spans: list[tuple[int, int]]) -> str:
     if not spans:
-        return text
+        cleaned = TOOL_RESULT_PATTERN.sub("", text)
+        cleaned = TOOL_CHATTER_PATTERN.sub("", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
     parts: list[str] = []
     cursor = 0
     for start, end in spans:
@@ -401,6 +314,7 @@ def _remove_spans(text: str, spans: list[tuple[int, int]]) -> str:
     parts.append(text[cursor:])
     cleaned = "".join(parts)
     cleaned = TOOL_RESULT_PATTERN.sub("", cleaned)
+    cleaned = TOOL_CHATTER_PATTERN.sub("", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
 
@@ -436,11 +350,24 @@ def _find_incomplete_block_start(text: str) -> int | None:
 
 def _find_partial_tag_start(text: str) -> int | None:
     for hint in TAG_NAME_HINTS:
-        max_overlap = min(len(hint) - 1, len(text))
+        max_overlap = min(len(hint), len(text))
         for size in range(max_overlap, 0, -1):
             if text.endswith(hint[:size]):
                 return len(text) - size
     return None
+
+
+def _looks_like_tool_markup_fragment(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("<ml_") or stripped.startswith("</ml_"):
+        return True
+    if stripped.startswith("<tool_") or stripped.startswith("</tool_"):
+        return True
+    if stripped.startswith("<m") and any(token in stripped for token in ("ml_", "tool_", "tool_calls", "tool_result")):
+        return True
+    return False
 
 
 def _split_stream_text(
@@ -448,10 +375,11 @@ def _split_stream_text(
     allowed_tool_names: set[str] | None,
     final: bool,
 ) -> tuple[str, str, list[dict[str, object]]]:
-    hold_from_candidates = [index for index in (
-        _find_unmatched_fence_start(text),
-        _find_incomplete_block_start(text),
-    ) if index is not None]
+    hold_from_candidates = [
+        index
+        for index in (_find_unmatched_fence_start(text), _find_incomplete_block_start(text))
+        if index is not None
+    ]
 
     if not final:
         partial_start = _find_partial_tag_start(text)
@@ -467,9 +395,7 @@ def _split_stream_text(
 
     processable = text[:safe_end]
     remainder = text[safe_end:]
-    fallback_spans, fallback_calls = _parse_function_parameter_markup(processable, allowed_tool_names)
     spans, tool_calls = _extract_tool_blocks(processable, allowed_tool_names)
-    spans, tool_calls = _merge_tool_parse_results(fallback_spans, fallback_calls, spans, tool_calls)
     visible = _remove_spans(processable, spans)
     return visible, remainder, tool_calls
 
@@ -477,9 +403,7 @@ def _split_stream_text(
 def parse_tool_calls_from_text(text: str, allowed_tool_names: set[str] | None = None) -> tuple[str, list[dict[str, object]]]:
     if not text:
         return "", []
-    fallback_spans, fallback_calls = _parse_function_parameter_markup(text, allowed_tool_names)
     spans, tool_calls = _extract_tool_blocks(text, allowed_tool_names)
-    spans, tool_calls = _merge_tool_parse_results(fallback_spans, fallback_calls, spans, tool_calls)
     return _remove_spans(text, spans), tool_calls
 
 
@@ -510,4 +434,5 @@ class StreamingToolParser:
         )
         self.pending_text = ""
         self.tool_calls.extend(parsed_calls)
-        return (visible + remainder).strip(), self.tool_calls
+        tail = "" if _looks_like_tool_markup_fragment(remainder) else remainder
+        return (visible + tail).strip(), self.tool_calls
