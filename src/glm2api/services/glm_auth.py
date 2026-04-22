@@ -30,6 +30,17 @@ def build_sign() -> tuple[str, str, str]:
     return timestamp, nonce, sign
 
 
+def build_random_x_forwarded_for() -> str:
+    while True:
+        first_octet = random.randint(1, 223)
+        if first_octet in {10, 127, 169, 172, 192}:
+            continue
+        octets = [first_octet]
+        for _ in range(3):
+            octets.append(random.randint(0, 255))
+        return ".".join(str(octet) for octet in octets)
+
+
 @dataclass(slots=True)
 class AccessToken:
     access_token: str
@@ -83,6 +94,7 @@ class GLMAccessTokenManager:
             "X-Device-Brand": "",
             "X-Device-Model": "",
             "X-Lang": "zh",
+            "X-Forwarded-For": build_random_x_forwarded_for(),
         }
 
     def read_json_response(self, response) -> dict[str, object]:

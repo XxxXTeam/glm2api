@@ -1,6 +1,25 @@
 from glm2api.services.anthropic_adapter import anthropic_to_openai
+from glm2api.services.glm_auth import GLMAccessTokenManager
 from glm2api.services.glm_client import GLMWebClient, UpstreamAPIError
 from glm2api.services.responses_adapter import responses_to_openai
+
+
+class _DummyConfig:
+    glm_user_agent = "Mozilla/5.0"
+
+
+def test_get_browser_headers_includes_random_x_forwarded_for():
+    manager = GLMAccessTokenManager.__new__(GLMAccessTokenManager)
+    manager.config = _DummyConfig()
+
+    headers = manager.get_browser_headers()
+    xff = headers["X-Forwarded-For"]
+    octets = xff.split(".")
+
+    assert len(octets) == 4
+    assert all(part.isdigit() for part in octets)
+    assert 1 <= int(octets[0]) <= 223
+    assert int(octets[0]) not in {10, 127, 169, 172, 192}
 
 
 def test_responses_to_openai_preserves_tool_choice():
