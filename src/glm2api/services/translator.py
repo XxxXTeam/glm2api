@@ -678,7 +678,7 @@ class GLMEventAccumulator:
                 if is_new:
                     self._known_logic_ids_for_text.append(logic_id)
                     if text_delta_parts or self._part_text_sent:
-                        text_delta_parts.append("\n")
+                        text_delta_parts.append("\n\n")
                     text_delta_parts.append(rendered_text)
                 elif len(rendered_text) > prev_len:
                     text_delta_parts.append(rendered_text[prev_len:])
@@ -690,7 +690,7 @@ class GLMEventAccumulator:
                 if is_new:
                     self._known_logic_ids_for_reasoning.append(logic_id)
                     if reasoning_delta_parts or self._part_reasoning_sent:
-                        reasoning_delta_parts.append("\n")
+                        reasoning_delta_parts.append("\n\n")
                     reasoning_delta_parts.append(rendered_reasoning)
                 elif len(rendered_reasoning) > prev_len:
                     reasoning_delta_parts.append(rendered_reasoning[prev_len:])
@@ -744,8 +744,8 @@ class GLMEventAccumulator:
                 reasoning_parts.append(rendered_reasoning)
                 self._cached_part_reasonings[logic_id] = rendered_reasoning
 
-        self._cached_full_text = "\n".join(text_parts)
-        self._cached_full_reasoning = "\n".join(reasoning_parts)
+        self._cached_full_text = "\n\n".join(text_parts)
+        self._cached_full_reasoning = "\n\n".join(reasoning_parts)
         self._render_cache_dirty = False
         return self._cached_full_text, self._cached_full_reasoning
 

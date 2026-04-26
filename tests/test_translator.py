@@ -202,3 +202,43 @@ def test_accumulator_repairs_param_name_only_tool_call_with_fallback_url():
         message["tool_calls"][0]["function"]["arguments"]
         == '{"url":"https://opendata.baidu.com/api.php?query=1.1.1.1&co=&resource_id=6006&oe=utf8"}'
     )
+
+
+def test_accumulator_keeps_markdown_block_separators_between_parts():
+    accumulator = GLMEventAccumulator(model="glm-test")
+
+    first_chunks, _ = accumulator.consume_event(
+        {
+            "conversation_id": "conv_1",
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [
+                        {"type": "text", "text": "## 查询结果：IP 地址 `1.1.1.1` 的归属地信息"},
+                    ],
+                }
+            ],
+        }
+    )
+    second_chunks, _ = accumulator.consume_event(
+        {
+            "conversation_id": "conv_1",
+            "parts": [
+                {
+                    "logic_id": "2",
+                    "content": [
+                        {"type": "text", "text": "| 字段 | 值 |\n|---|---|\n| 查询 IP | `1.1.1.1` |"},
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert first_chunks
+    assert second_chunks[0].find("\\n\\n") != -1
+
+    response = accumulator.build_response()
+    assert response["choices"][0]["message"]["content"] == (
+        "## 查询结果：IP 地址 `1.1.1.1` 的归属地信息\n\n"
+        "| 字段 | 值 |\n|---|---|\n| 查询 IP | `1.1.1.1` |"
+    )

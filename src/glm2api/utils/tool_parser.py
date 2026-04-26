@@ -297,12 +297,12 @@ def _extract_tool_blocks(text: str, allowed_tool_names: set[str] | None) -> tupl
     return spans, tool_calls
 
 
-def _remove_spans(text: str, spans: list[tuple[int, int]]) -> str:
+def _remove_spans(text: str, spans: list[tuple[int, int]], *, trim_outer_whitespace: bool = True) -> str:
     if not spans:
         cleaned = TOOL_RESULT_PATTERN.sub("", text)
         cleaned = TOOL_CHATTER_PATTERN.sub("", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-        return cleaned.strip()
+        return cleaned.strip() if trim_outer_whitespace else cleaned
 
     parts: list[str] = []
     cursor = 0
@@ -316,7 +316,7 @@ def _remove_spans(text: str, spans: list[tuple[int, int]]) -> str:
     cleaned = TOOL_RESULT_PATTERN.sub("", cleaned)
     cleaned = TOOL_CHATTER_PATTERN.sub("", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
+    return cleaned.strip() if trim_outer_whitespace else cleaned
 
 
 def _find_unmatched_fence_start(text: str) -> int | None:
@@ -396,7 +396,7 @@ def _split_stream_text(
     processable = text[:safe_end]
     remainder = text[safe_end:]
     spans, tool_calls = _extract_tool_blocks(processable, allowed_tool_names)
-    visible = _remove_spans(processable, spans)
+    visible = _remove_spans(processable, spans, trim_outer_whitespace=final)
     return visible, remainder, tool_calls
 
 
