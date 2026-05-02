@@ -1,11 +1,5 @@
 # ChatGLM 2 API
 
-## 已取消维护
-
-![图片1](https://pro-cs-freq.udeskcs.com/chat_upload/tid26/0017732a0b8e70d778b5e64a735a0d851777298167_1777298167388_a4dee0?OSSAccessKeyId=LTAI5tGLdqHDT2hBX8kvY2WR&Expires=1777326967&Signature=s0Oteyi4PnrSBtSb64kTxkv6Tf8%3D)
-
-![图片2](https://pro-cs-freq.udeskcs.com/chat_upload/tid26/0a5998835b5cbd47e4e7585875d2402a1777298186_1777298186395_69d965?OSSAccessKeyId=LTAI5tGLdqHDT2hBX8kvY2WR&Expires=1777326986&Signature=CWOWOGcScsfCK5ITXKCm5wD8Ncw%3D)
-
 `glm2api` 是一个本地代理服务，用来把 `chatglm.cn` 的网页接口转换成 OpenAI 兼容接口，方便你直接接入 OpenAI SDK、Cherry Studio、Open WebUI、LobeChat 或其他兼容 OpenAI API 的工具。
 
 支持的主要接口：
