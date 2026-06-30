@@ -232,16 +232,21 @@ class GLM2APIServer:
 
             def _stream_anthropic(self, openai_payload: dict[str, object], model: str) -> None:
                 openai_payload["stream"] = True
-                stream_iter = glm_client.stream_chat_completion(openai_payload)
                 accumulator = AnthropicStreamAccumulator(model=model)
 
                 self.send_response(HTTPStatus.OK)
                 self._send_common_headers()
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
 
+                try:
+                    self.wfile.flush()
+                except _CLIENT_DISCONNECTED:
+                    return
+
+                stream_iter = glm_client.stream_chat_completion(openai_payload)
                 try:
                     for chunk in stream_iter:
                         if not chunk:
@@ -287,16 +292,21 @@ class GLM2APIServer:
 
             def _stream_responses(self, openai_payload: dict[str, object], model: str) -> None:
                 openai_payload["stream"] = True
-                stream_iter = glm_client.stream_chat_completion(openai_payload)
                 accumulator = ResponsesStreamAccumulator(model=model)
 
                 self.send_response(HTTPStatus.OK)
                 self._send_common_headers()
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
 
+                try:
+                    self.wfile.flush()
+                except _CLIENT_DISCONNECTED:
+                    return
+
+                stream_iter = glm_client.stream_chat_completion(openai_payload)
                 chunk_queue: queue.Queue[object] = queue.Queue()
                 sentinel = object()
 
@@ -358,14 +368,20 @@ class GLM2APIServer:
             def _stream_completion(self, payload: dict[str, object]) -> None:
                 model = str(payload.get("model", "unknown"))
                 logger.info("开始流式响应 model=%s", model)
-                stream_iter = glm_client.stream_chat_completion(payload)
                 self.send_response(HTTPStatus.OK)
                 self._send_common_headers()
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
 
+                # Send keepalive comment immediately to prevent GUI timeout
+                try:
+                    self.wfile.flush()
+                except _CLIENT_DISCONNECTED:
+                    return
+
+                stream_iter = glm_client.stream_chat_completion(payload)
                 sent_done = False
                 try:
                     for chunk in stream_iter:

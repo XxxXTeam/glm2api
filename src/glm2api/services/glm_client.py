@@ -23,11 +23,14 @@ from ..config import AppConfig
 from ..logging_utils import debug_dump
 from .glm_auth import GLMAccessTokenManager, build_sign
 from .translator import (
+    _cache_search_query,
+    _wait_for_search_result,
     BLOCKED_NATIVE_TOOL_NAMES,
     GLMEventAccumulator,
     SERVER_SIDE_TOOL_NAMES,
     convert_messages,
     extract_recent_user_url,
+    extract_text_content,
     filter_tools,
     resolve_chat_mode,
     resolve_networking,
@@ -297,7 +300,7 @@ class GLMWebClient:
         if not self.config.glm_delete_conversation:
             return
         if not conversation_id:
-            self.logger.warning("跳过删除 GLM 会话：未获取到 conversation_id assistant_id=%s", assistant_id or self.config.glm_assistant_id)
+            self.logger.debug("跳过删除 GLM 会话：未获取到 conversation_id assistant_id=%s", assistant_id or self.config.glm_assistant_id)
             return
 
         actual_assistant_id = assistant_id or self.config.glm_assistant_id
@@ -308,48 +311,29 @@ class GLMWebClient:
             }
         ).encode("utf-8")
         try:
-            def send_request(account_index: int, access_token: str):
-                timestamp, nonce, sign = build_sign()
-                request = urllib.request.Request(
-                    self.config.delete_conversation_url,
-                    method="POST",
-                    data=body,
-                    headers={
-                        **self.auth.get_browser_headers(),
-                        "Authorization": f"Bearer {access_token}",
-                        "Referer": "https://chatglm.cn/main/alltoolsdetail",
-                        "X-Device-Id": uuid.uuid4().hex,
-                        "X-Nonce": nonce,
-                        "X-Request-Id": uuid.uuid4().hex,
-                        "X-Sign": sign,
-                        "X-Timestamp": timestamp,
-                    },
-                )
-                return urllib.request.urlopen(request, timeout=self.config.request_timeout)
-
-            with self._call_with_account_failover("delete_conversation", send_request) as response: # type: ignore
-                payload = self.auth.read_json_response(response)
-            status = payload.get("status", payload.get("code"))
-            if status not in {0, None}:
-                self.logger.warning(
-                    "GLM 会话删除返回非成功状态 conversation_id=%s assistant_id=%s payload=%s",
-                    conversation_id,
-                    actual_assistant_id,
-                    payload,
-                )
-                return
-            self.logger.info(
-                "已删除 GLM 会话 conversation_id=%s assistant_id=%s",
-                conversation_id,
-                actual_assistant_id,
+            # Direct call — no account failover for cleanup ops.
+            # Guest conversations are ephemeral; delete failures are harmless.
+            timestamp, nonce, sign = build_sign()
+            request = urllib.request.Request(
+                self.config.delete_conversation_url,
+                method="POST",
+                data=body,
+                headers={
+                    **self.auth.get_browser_headers(),
+                    "Authorization": f"Bearer {self.auth.get_access_token()}",
+                    "Referer": "https://chatglm.cn/main/alltoolsdetail",
+                    "X-Device-Id": uuid.uuid4().hex,
+                    "X-Nonce": nonce,
+                    "X-Request-Id": uuid.uuid4().hex,
+                    "X-Sign": sign,
+                    "X-Timestamp": timestamp,
+                },
             )
-        except Exception as exc:
-            self.logger.warning(
-                "删除 GLM 会话失败 conversation_id=%s assistant_id=%s error=%s",
-                conversation_id,
-                actual_assistant_id,
-                exc,
-            )
+            with urllib.request.urlopen(request, timeout=min(self.config.request_timeout, 10)) as response:
+                self.auth.read_json_response(response)
+            self.logger.debug("已删除 GLM 会话 conversation_id=%s", conversation_id)
+        except Exception:
+            pass  # best-effort cleanup, never retry
 
     def _open_chat_stream(self, openai_payload: dict[str, object], preferred_account_index: int | None = None):
         requested_model = str(openai_payload.get("model", "glm-4"))
@@ -362,6 +346,11 @@ class GLMWebClient:
             tool_choice=openai_payload.get("tool_choice"),
             server_side_tool_names=SERVER_SIDE_TOOL_NAMES,
         )
+        if self.config.glm_use_guest_refresh_token:
+            converted_messages = [
+                {"role": "user", "content": [{"type": "text", "text": "Reply exclusively in English. Do not use Chinese."}]},
+                *converted_messages,
+            ]
         debug_dump(self.logger, self.config.debug_dump_all, "OpenAI 原始 chat 请求 payload", openai_payload)
         debug_dump(self.logger, self.config.debug_dump_all, "转换后的 GLM messages", converted_messages)
         refs = self._upload_referenced_files(list(openai_payload.get("messages", []))) # type: ignore
@@ -378,6 +367,47 @@ class GLMWebClient:
             model=requested_model,
             web_search=openai_payload.get("web_search"),
         )
+
+
+
+        # Ponytail: DDG search pre-fetch + direct prompt injection for guest search.
+        # Fires DDG search in parallel, then waits briefly for cached results and
+        # injects the *actual* search result text into the prompt so the model has
+        # search context immediately — even when upstream is_networking is unreliable
+        # for guest tokens.  This eliminates the ~22s tool-call-intercept path.
+        _prefetch_query = None
+        _prefetch_search_results = None
+        _should_prefetch = (
+            not is_networking
+            or self.config.glm_use_guest_refresh_token
+            or "search" in requested_model.lower()
+        )
+        if _should_prefetch:
+            for msg in openai_payload.get("messages", []):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    user_text = extract_text_content(msg.get("content"))
+                    if user_text and len(user_text.strip()) > 10:
+                        _prefetch_query = user_text.strip()
+                        _cache_search_query(_prefetch_query)
+                        # Wait up to 8s for the background DDG fetch to populate the cache
+                        _prefetch_search_results = _wait_for_search_result(_prefetch_query, timeout=8.0)
+                        break
+
+        # If search model variant and we have actual DDG results, inject them as
+        # a user message before the conversation.  This gives the model immediate
+        # search context without needing upstream is_networking/tool-call interception.
+        # ponytail: DDG pre-fetch succeeded → inject results into prompt, disable
+        # is_networking AND use non-search assistant so upstream treats it as a plain
+        # chat.  This avoids the ~22-70s tool-call-intercept + verbose output path.
+        if _prefetch_search_results and ("search" in requested_model.lower() or is_networking):
+            search_msg = {
+                "role": "user",
+                "content": [{"type": "text", "text": _prefetch_search_results}]
+            }
+            converted_messages = [search_msg] + list(converted_messages)
+            is_networking = False          # ponytail: DDG already in prompt
+            upstream_model, _ = resolve_upstream_model(requested_model, self.config)  # strips -search
+
 
         request_body = json.dumps(
             {

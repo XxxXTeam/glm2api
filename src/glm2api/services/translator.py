@@ -6,7 +6,11 @@ import re
 import time
 from bisect import insort
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from logging import Logger
+import threading
+from threading import Lock
+from urllib.parse import parse_qs, unquote, urlparse
 
 from ..config import AppConfig
 from ..logging_utils import debug_dump
@@ -30,6 +34,246 @@ ASSISTANT_ID_PATTERN = re.compile(r"^[a-z0-9]{24,}$")
 URL_PATTERN = re.compile(r"https?://[^\s<>()\"']+")
 POWERSHELL_CMDLET_PATTERN = re.compile(r"^[A-Z][A-Za-z]+-[A-Z][A-Za-z]+$")
 POWERSHELL_ALIASES = {"cat", "cd", "copy", "del", "dir", "echo", "erase", "ls", "md", "move", "pwd", "rd", "ren", "rm", "sc", "type"}
+
+# Ponytail: free DuckDuckGo search as fallback for guest mode search
+_SEARCH_TOOL_NAMES = {"retrieve", "search", "web_search"}
+_SEARCH_RESULT_COUNT = 8
+
+# Thread-safe search cache for parallel pre-fetch (ponytail: zero-wait DDG)
+_SEARCH_CACHE: dict[str, tuple[float, str]] = {}
+_SEARCH_CACHE_LOCK = Lock()
+_SEARCH_CACHE_TTL = 60.0  # seconds to keep cached results
+
+def _cache_search_query(query: str) -> None:
+    """Pre-fetch search results in a background thread and cache them.
+    Uses _run_web_search (which has all imports resolved at call time)."""
+    t = threading.Thread(target=_do_cache_search, args=(query,), daemon=True)
+    t.start()
+
+def _do_cache_search(query: str) -> None:
+    """Worker: run the search and cache results."""
+    try:
+        result = _run_web_search(query)
+        if result and not result.startswith("Search error") and not result.startswith("No search"):
+            with _SEARCH_CACHE_LOCK:
+                _SEARCH_CACHE[query.lower().strip()] = (time.time(), result)
+    except Exception:
+        pass
+
+def _get_cached_search(query: str) -> str | None:
+    """Get cached search results if they exist and are fresh."""
+    with _SEARCH_CACHE_LOCK:
+        entry = _SEARCH_CACHE.get(query.lower().strip())
+        if entry and (time.time() - entry[0]) < _SEARCH_CACHE_TTL:
+            return entry[1]
+    return None
+
+def _evict_stale_cache() -> None:
+    """Remove expired cache entries."""
+    now = time.time()
+    with _SEARCH_CACHE_LOCK:
+        expired = [k for k, v in _SEARCH_CACHE.items() if (now - v[0]) >= _SEARCH_CACHE_TTL]
+        for k in expired:
+            del _SEARCH_CACHE[k]
+
+
+def _wait_for_search_result(query: str, timeout: float = 5.0) -> str | None:
+    """Get cached search results, waiting up to `timeout` seconds if still being fetched."""
+    # First check cache immediately
+    cached = _get_cached_search(query)
+    if cached:
+        return cached
+    
+    # If not cached yet, a background fetch may be in progress - wait a bit
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.1)
+        cached = _get_cached_search(query)
+        if cached:
+            return cached
+    return None
+
+
+def _ddg_unwrap_url(href: str) -> str:
+    """DuckDuckGo Lite wraps real result URLs as
+    //duckduckgo.com/l/?uddg=ENCODED&rut=... — unwrap the ``uddg`` param."""
+    if not href:
+        return ""
+    if href.startswith("//"):
+        href = "https:" + href
+    try:
+        qs = parse_qs(urlparse(href).query)
+        if "uddg" in qs:
+            return unquote(qs["uddg"][0])
+    except Exception:
+        pass
+    return href
+
+
+def _parse_ddg_lite(html: str) -> list[tuple[str, str, str]]:
+    """Parse DuckDuckGo Lite HTML into (title, url, snippet) tuples.
+
+    Uses BeautifulSoup with the lxml backend (tolerant of malformed markup).
+    Results anchors carry class ``result-link``; snippets live in
+    ``td.result-snippet``. Both lists are in document order and line up 1:1.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return _parse_ddg_lite_fallback(html)
+
+    soup = BeautifulSoup(html, "lxml")
+    links = soup.select("a.result-link") or soup.select("a.result-a")
+    snippets = [td.get_text(" ", strip=True) for td in soup.select("td.result-snippet")]
+    results: list[tuple[str, str, str]] = []
+    for idx, link in enumerate(links):
+        title = link.get_text(" ", strip=True)
+        if not title:
+            continue
+        url = _ddg_unwrap_url(link.get("href", ""))
+        snippet = snippets[idx] if idx < len(snippets) else ""
+        results.append((title, url, snippet))
+    return results
+
+
+def _parse_ddg_lite_fallback(html: str) -> list[tuple[str, str, str]]:
+    """Minimal stdlib fallback if BeautifulSoup/lxml are unavailable."""
+    parser = _DDGLiteParser()
+    parser.feed(html)
+    parser.close()
+    return parser.results
+
+
+class _DDGLiteParser(HTMLParser):
+    """Stdlib fallback parser for DuckDuckGo Lite (used only if bs4 missing)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.results: list[tuple[str, str, str]] = []
+        self._in_link = False
+        self._in_snippet = False
+        self._title = ""
+        self._href = ""
+        self._snippet = ""
+        self._pending: tuple[str, str] | None = None
+
+    def _commit(self) -> None:
+        if self._pending is not None:
+            title, url = self._pending
+            self.results.append((title, url, " ".join(self._snippet.split())))
+            self._pending = None
+        self._snippet = ""
+
+    def handle_starttag(self, tag, attrs):
+        d = dict(attrs)
+        if tag == "a" and ("result-link" in d.get("class", "") or "result-a" in d.get("class", "")):
+            self._commit()
+            self._in_link = True
+            self._href = d.get("href", "")
+            self._title = ""
+        elif tag == "td" and "result-snippet" in d.get("class", ""):
+            self._in_snippet = True
+            self._snippet = ""
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._in_link:
+            self._in_link = False
+            self._pending = (self._title.strip(), _ddg_unwrap_url(self._href))
+        elif tag == "td" and self._in_snippet:
+            self._in_snippet = False
+
+    def handle_data(self, data):
+        if self._in_link:
+            self._title += data
+        if self._in_snippet:
+            self._snippet += data
+
+    def close(self):  # type: ignore[override]
+        super().close()
+        self._commit()
+
+
+def _run_web_search(query: str) -> str:
+    """Search via DuckDuckGo Lite using curl_cffi (Chrome TLS/JA3 fingerprint).
+
+    No API key required. The ``impersonate="chrome"`` flag reproduces Chrome's
+    TLS handshake + HTTP/2 fingerprint, which bypasses DDG bot detection that
+    plain requests/httpx cannot pass.
+    """
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError as exc:
+        return f"Search unavailable: curl_cffi not installed ({exc})."
+
+    try:
+        resp = cffi_requests.get(
+            "https://lite.duckduckgo.com/lite/",
+            params={"q": query, "kl": "us-en"},
+            impersonate="chrome",
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return f"Search error: HTTP {resp.status_code}"
+        results = _parse_ddg_lite(resp.text)
+    except Exception as exc:
+        return f"Search error: {exc}"
+
+    if not results:
+        return f"No search results found for: {query}"
+
+    lines = [f'Web search results for "{query}":']
+    for i, (title, link, snippet) in enumerate(results[:_SEARCH_RESULT_COUNT], 1):
+        lines.append(f"{i}. {title}\n   URL: {link}\n   {snippet}")
+    return "\n".join(lines)
+
+
+def _execute_retrieve_tool_calls(tool_calls: list[dict[str, object]]) -> tuple[str, list[dict[str, object]]]:
+    """Intercept retrieve/search tool calls, execute via DuckDuckGo, return content + remaining tool calls."""
+    if not tool_calls:
+        return "", tool_calls
+
+    search_results: list[str] = []
+    remaining: list[dict[str, object]] = []
+
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        tool_name = str(fn.get("name", "")).strip().lower()
+        if tool_name not in _SEARCH_TOOL_NAMES:
+            remaining.append(tc)
+            continue
+
+        arguments = fn.get("arguments", "{}")
+        try:
+            args = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except json.JSONDecodeError:
+            remaining.append(tc)
+            continue
+
+        # Extract queries from various argument formats
+        queries: list[str] = []
+        if isinstance(args, dict):
+            for val in args.values():
+                if isinstance(val, str):
+                    queries.append(val)
+                elif isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, dict):
+                            for v in item.values():
+                                if isinstance(v, str):
+                                    queries.append(v)
+                        elif isinstance(item, str):
+                            queries.append(item)
+
+        for q in queries:
+            if q.strip():
+                result = _run_web_search(q.strip())
+                search_results.append(f"Search query: {q}\n\nResults:\n{result}")
+
+    if search_results:
+        content = "\n\n---\n\n".join(search_results)
+        return content, remaining
+
+    return "", tool_calls
 
 
 
@@ -594,6 +838,20 @@ class GLMEventAccumulator:
             tc_copy["index"] = len(all_tool_calls)
             all_tool_calls.append(tc_copy)
 
+        # Ponytail: intercept retrieve/search tool calls with DuckDuckGo fallback
+        search_content, remaining_tool_calls = _execute_retrieve_tool_calls(all_tool_calls)
+        if search_content:
+            all_tool_calls = remaining_tool_calls
+            if self.allowed_tool_names is not None:
+                self._deferred_visible_text += "\n\n" + search_content
+            else:
+                if tail_text:
+                    tail_text += "\n\n" + search_content
+                else:
+                    tail_text = search_content
+            if self.logger:
+                self.logger.info("已拦截检索工具调用，通过 DuckDuckGo 执行搜索 text_len=%s", len(search_content))
+
         if self.logger:
             self.logger.info(
                 "响应收尾 status=%s text_len=%s reasoning_len=%s tool_calls=%s server_tools=%s",
@@ -741,6 +999,15 @@ class GLMEventAccumulator:
             tc_copy = dict(tc)
             tc_copy["index"] = len(all_tool_calls)
             all_tool_calls.append(tc_copy)
+
+        # Ponytail: intercept retrieve/search tool calls with DuckDuckGo fallback.
+        # Run BEFORE computing final_content so search results flow into `content`.
+        search_content, remaining_tool_calls = _execute_retrieve_tool_calls(all_tool_calls)
+        if search_content:
+            all_tool_calls = remaining_tool_calls
+            clean_content = (clean_content + "\n\n" + search_content) if clean_content else search_content
+            if self.logger:
+                self.logger.info("非流式：已拦截检索工具调用，通过 DuckDuckGo 执行搜索 text_len=%s", len(search_content))
 
         final_content = clean_content.strip()
         message: dict[str, object] = {

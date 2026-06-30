@@ -98,7 +98,7 @@ class GLMAccessTokenManager:
             "X-App-Version": "0.0.1",
             "X-Device-Brand": "",
             "X-Device-Model": "",
-            "X-Lang": "zh",
+            "X-Lang": "en" if self.config.glm_use_guest_refresh_token else "zh",
             "X-Forwarded-For": build_random_x_forwarded_for(),
         }
 
@@ -302,14 +302,20 @@ class GLMAccessTokenManager:
             raise RuntimeError(f"写入 .env 失败: {env_path} error={exc}") from exc
 
     def should_switch_account(self, exc: Exception) -> bool:
-        if hasattr(exc, "status_code"):
-            return True
         if isinstance(exc, urllib.error.HTTPError):
-            return True
+            code = getattr(exc, "code", 0)
+            if code in {401, 403}:
+                return True
+            return False
+        if hasattr(exc, "status_code"):
+            code = getattr(exc, "status_code", 0)
+            if code in {401, 403}:
+                return True
+            return False
         if isinstance(exc, urllib.error.URLError):
-            return True
+            return False
         if isinstance(exc, TimeoutError):
-            return True
+            return False
         if isinstance(exc, RuntimeError):
             return "token" in str(exc).lower()
         return False
