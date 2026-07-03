@@ -10,10 +10,7 @@ import json
 import time
 import uuid
 
-
-def _safe_json(obj: object) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-
+from ..utils.tool_protocol import safe_json_dumps
 
 # ---------------------------------------------------------------------------
 # Request conversion: Anthropic -> OpenAI chat/completions
@@ -186,7 +183,13 @@ def anthropic_to_openai(payload: dict[str, object]) -> dict[str, object]:
     # --- thinking ---
     thinking = payload.get("thinking")
     if isinstance(thinking, dict) and thinking.get("type") == "enabled":
-        result["reasoning_effort"] = thinking.get("budget_tokens", "medium")
+        _budget = thinking.get("budget_tokens", 0)
+        if isinstance(_budget, int) and _budget >= 16000:
+            result["reasoning_effort"] = "high"
+        elif isinstance(_budget, int) and _budget >= 8000:
+            result["reasoning_effort"] = "medium"
+        else:
+            result["reasoning_effort"] = "low"
 
     return result
 
@@ -456,4 +459,4 @@ class AnthropicStreamAccumulator:
         return event
 
     def _sse(self, event_type: str, data: dict[str, object]) -> str:
-        return f"event: {event_type}\ndata: {_safe_json(data)}\n\n"
+        return f"event: {event_type}\ndata: {safe_json_dumps(data)}\n\n"

@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "将智谱清言 GLM Web 端接口转换为 OpenAI Chat Completions 兼容 API 的轻量代理。"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = ["curl-cffi>=0.7", "beautifulsoup4>=4.12", "lxml>=5.0"]
+dependencies = [
+    "httpx[http2,socks]>=0.28.1",
+]  # Ponytail: all deps removed — pure stdlib now
 
 [project.scripts]
 glm2api = "glm2api.__main__:main"

@@ -26,6 +26,14 @@ class Application:
             len(config.exposed_models),
         )
         self.client = GLMWebClient(config=config, logger=get_logger("glm2api.glm"))
+        if config.glm_use_guest_refresh_token:
+            import threading
+            def _bg_prewarm():
+                try:
+                    self.client.auth.prewarm_guest_tokens()
+                except Exception as exc:
+                    self.logger.warning(f"预热游客 token 失败: {exc}")
+            threading.Thread(target=_bg_prewarm, daemon=True, name="prewarm").start()
         try:
             self.server = GLM2APIServer(
                 config=config,
@@ -69,6 +77,12 @@ class Application:
             return
         self._stopping = True
         self.logger.info("停止 HTTP 服务并释放监听端口...")
+        # Cleanup connection pool
+        try:
+            from .services.http_client import close_all
+            close_all()
+        except Exception:
+            pass
         try:
             self.server.shutdown()
         except Exception as exc:

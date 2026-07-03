@@ -10,10 +10,7 @@ import json
 import time
 import uuid
 
-
-def _safe_json(obj: object) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-
+from ..utils.tool_protocol import safe_json_dumps
 
 def _response_part_to_openai(part: dict[str, object]) -> dict[str, object] | None:
     part_type = part.get("type")
@@ -624,4 +621,4 @@ class ResponsesStreamAccumulator:
         event_payload["model"] = self.model
         event_payload["sequence_number"] = self.sequence_number
         self.sequence_number += 1
-        return f"event: {event_type}\ndata: {_safe_json(event_payload)}\n\n"
+        return f"event: {event_type}\ndata: {safe_json_dumps(event_payload)}\n\n"

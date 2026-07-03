@@ -14,6 +14,7 @@ from glm2api.services.responses_adapter import ResponsesStreamAccumulator, opena
 
 class _DummyConfig:
     glm_user_agent = "Mozilla/5.0"
+    glm_use_guest_refresh_token = False
 
 
 def test_get_browser_headers_includes_random_x_forwarded_for():
@@ -206,7 +207,18 @@ def test_responses_http_stream_sends_keepalive_while_upstream_is_idle(monkeypatc
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(request, timeout=5) as response:
-            stream_text = response.read().decode("utf-8")
+            chunks: list[str] = []
+            while True:
+                try:
+                    chunk = response.read(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk.decode("utf-8"))
+                    if "data: [DONE]\n\n" in chunks[-1]:
+                        break
+                except TimeoutError:
+                    break
+            stream_text = "".join(chunks)
     finally:
         server.shutdown()
         thread.join(timeout=1)

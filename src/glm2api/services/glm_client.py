@@ -3,10 +3,13 @@ from __future__ import annotations
 import base64
 import codecs
 import gzip
+import select
 import http.client
 import json
 import mimetypes
+import os as _os_module
 import re
+import socket
 import threading
 import time
 import uuid
@@ -22,6 +25,9 @@ from typing import Callable
 from ..config import AppConfig
 from ..logging_utils import debug_dump
 from .glm_auth import GLMAccessTokenManager, build_sign
+STREAM_READ_TIMEOUT = int(_os_module.environ.get('GLM_STREAM_READ_TIMEOUT_SECONDS', '60'))
+
+
 from .translator import (
     _cache_search_query,
     _wait_for_search_result,
@@ -49,6 +55,43 @@ IMAGE_SIZE_TO_ASPECT_RATIO = {
 }
 
 
+def _get_glm_opener():
+    """Compatibility shim — delegates to http_client.do_request.
+    
+    Existing code calls `_get_glm_opener().open(request, timeout=...)` which returns
+    a urllib addinfourl. We intercept that and route through curl_cffi.
+    """
+    from .http_client import do_request
+    from .glm2api_proxy import get_pool
+
+    class _OpenerShim:
+        def open(self, request, timeout=None):
+            pool = get_pool()
+            proxy_url = pool.get_next() if pool._proxies else None
+            headers = dict(getattr(request, 'header_items', lambda: [])())
+            method = request.get_method() if hasattr(request, 'get_method') else "POST"
+            url = request.full_url if hasattr(request, 'full_url') else str(request)
+            data = request.data if hasattr(request, 'data') and request.data else None
+            try:
+                # stream=True for all requests — StreamingResponseWrapper handles
+                # both chunked reading (SSE) and full reads (JSON responses)
+                result = do_request(method, url, headers, data, proxy_url, timeout or 300, stream=True)
+                if proxy_url:
+                    pool.report_success(proxy_url, 0)
+                return result
+            except Exception as exc:
+                if proxy_url:
+                    pool.report_failure(proxy_url)
+                raise urllib.error.URLError(str(exc)) from exc
+
+        def close(self):
+            from .http_client import close_all
+            close_all()
+
+    return _OpenerShim()
+
+
+
 class UpstreamAPIError(RuntimeError):
     def __init__(self, status_code: int, message: str, payload: dict[str, object] | None = None) -> None:
         super().__init__(message)
@@ -74,51 +117,52 @@ class QueueLease:
 
 
 class ConcurrentRequestQueue:
+    """Per-account semaphore queue. Each account gets 5 concurrent slots (upstream per-IP limit).
+    30 accounts × 5 = 150 concurrent max, instead of global FIFO-5 bottleneck."""
+    
+    PER_ACCOUNT_LIMIT = 5  # upstream rate-limit per IP
+
     def __init__(self, logger: Logger, wait_timeout: int, max_concurrency: int) -> None:
         self.logger = logger
         self.wait_timeout = wait_timeout
-        self.max_concurrency = max(1, max_concurrency)
-        self._condition = threading.Condition()
-        self._next_ticket = 0
-        self._serving_ticket = 0
-        self._released_tickets: set[int] = set()
+        self._lock = threading.Lock()
+        self._cond = threading.Condition()
+        self._sems: list[threading.Semaphore] = []
 
-    def acquire(self, request_name: str) -> QueueLease:
-        with self._condition:
-            ticket = self._next_ticket
-            self._next_ticket += 1
-            queue_ahead = max(0, ticket - (self._serving_ticket + self.max_concurrency) + 1)
-            start = time.monotonic()
+    def _ensure_accounts(self, count: int) -> None:
+        with self._lock:
+            while len(self._sems) < count:
+                self._sems.append(threading.Semaphore(self.PER_ACCOUNT_LIMIT))
 
-            if queue_ahead > 0:
-                self.logger.info("请求进入 GLM 队列 ticket=%s ahead=%s request=%s", ticket, queue_ahead, request_name)
+    def acquire(self, request_name: str, account_pool_size: int = 0) -> QueueLease:
+        self._ensure_accounts(max(account_pool_size, 3))
+        start = time.monotonic()
 
-            while ticket >= self._serving_ticket + self.max_concurrency:
-                remaining = self.wait_timeout - (time.monotonic() - start)
-                if remaining <= 0:
-                    raise QueueTimeoutError(
-                        f"GLM 队列等待超时，前方仍有 {ticket - (self._serving_ticket + self.max_concurrency) + 1} 个请求，请稍后重试。"
-                    )
-                self._condition.wait(timeout=remaining)
+        while True:
+            remaining = self.wait_timeout - (time.monotonic() - start)
+            if remaining <= 0:
+                raise QueueTimeoutError(f"GLM 队列等待超时，请稍后重试。")
 
-            active_slots = ticket - self._serving_ticket + 1
-            self.logger.info(
-                "请求获得 GLM 执行槽位 ticket=%s active=%s/%s request=%s",
-                ticket,
-                active_slots,
-                self.max_concurrency,
-                request_name,
-            )
-            return QueueLease(ticket=ticket, release_callback=self._release)
+            with self._lock:
+                # Pick account with most free slots
+                best_idx = max(range(len(self._sems)), key=lambda i: self._sems[i]._value)
+                sem = self._sems[best_idx]
+                acquired = sem.acquire(blocking=False)
 
-    def _release(self, ticket: int) -> None:
-        with self._condition:
-            self._released_tickets.add(ticket)
-            while self._serving_ticket in self._released_tickets:
-                self._released_tickets.remove(self._serving_ticket)
-                self._serving_ticket += 1
-            self.logger.info("请求离开 GLM 执行槽位 ticket=%s", ticket)
-            self._condition.notify_all()
+            if acquired:
+                self.logger.info("请求获得 GLM 执行槽位 account=%s/%s request=%s", best_idx, len(self._sems), request_name)
+                return QueueLease(ticket=best_idx, release_callback=lambda t: self._do_release(t))
+
+            # All accounts busy — wait on condition
+            with self._cond:
+                self._cond.wait(timeout=min(remaining, 2.0))
+
+    def _do_release(self, account_idx: int) -> None:
+        with self._lock:
+            if account_idx < len(self._sems):
+                self._sems[account_idx].release()
+        with self._cond:
+            self._cond.notify_all()
 
 
 class GLMWebClient:
@@ -131,6 +175,55 @@ class GLMWebClient:
             wait_timeout=config.glm_queue_wait_timeout,
             max_concurrency=config.glm_max_concurrency,
         )
+        # Track which account index was used for the last request
+        self._last_account_index: int = 0
+
+    def _record_usage(self, account_index: int, response_data: dict[str, object] | None = None) -> None:
+        """
+        Record tool call / search usage for an account and pre-rotate if near quota.
+
+        Counts tool_calls in the response and records searches.
+        If the account is approaching its ~8 tool call / ~5 search limit,
+        proactively pre-warms the next guest account.
+        """
+        if not self.config.glm_use_guest_refresh_token:
+            return
+        if response_data:
+            for choice in response_data.get("choices", []):
+                if isinstance(choice, dict):
+                    msg = choice.get("message", {})
+                    if isinstance(msg, dict):
+                        tcs = msg.get("tool_calls", [])
+                        if isinstance(tcs, list):
+                            for tc in tcs:
+                                if isinstance(tc, dict):
+                                    fn = tc.get("function", {})
+                                    name = fn.get("name", "") if isinstance(fn, dict) else ""
+                                    if isinstance(name, str):
+                                        self.auth.record_tool_call(account_index)
+                                        if name.lower() in ("retrieve", "search", "web_search"):
+                                            self.auth.record_search(account_index)
+        # If near limit, pre-warm next slot
+        if self.auth.is_near_quota_limit(account_index):
+            self.logger.info(
+                "账号 index=%s 接近配额限制 (tool=%s,search=%s)，提前准备新账号",
+                account_index,
+                self.auth.get_usage(account_index)[0],
+                self.auth.get_usage(account_index)[1],
+            )
+            # Try to pre-warm the next lazy slot
+            prewarmed = self.auth.prewarm_next_guest_slot()
+            if prewarmed is not None:
+                self.logger.info("已提前预热备用游客账号 index=%s", prewarmed)
+            elif self.auth.spare_guest_slot_available():
+                self.logger.info("有未预热槽位，将在下次请求时预热")
+            else:
+                # All slots active - spawn an extra one
+                try:
+                    fresh = self.auth.spawn_fresh_guest_account()
+                    self.logger.info("提前创建新游客账号 index=%s 为配额轮换准备", fresh)
+                except Exception as exc:
+                    self.logger.warning("预创建新游客账号失败: %s", exc)
 
     def _resolve_tools(self, openai_payload: dict[str, object]) -> tuple[list[dict[str, object]] | None, set[str] | None]:
         raw_tools = list(openai_payload.get("tools", [])) if isinstance(openai_payload.get("tools"), list) else None # type: ignore
@@ -153,12 +246,13 @@ class GLMWebClient:
 
     def chat_completion(self, payload: dict[str, object]) -> tuple[dict[str, object], str | None]:
         _, allowed_tool_names = self._resolve_tools(payload)
-        lease = self.request_queue.acquire(f"chat:{payload.get('model', 'unknown')}")
+        lease = self.request_queue.acquire(f"chat:{payload.get('model', 'unknown')}", account_pool_size=self.auth.get_account_count())
         try:
-            response, assistant_id = self._open_chat_stream(payload, preferred_account_index=self._get_preferred_account_index(lease.ticket))
+            response, assistant_id = self._open_chat_stream(payload, preferred_account_index=self._get_preferred_account_index(lease.ticket), lease=lease)
         except Exception:
             lease.release()
             raise
+        account_index = self._last_account_index
         accumulator = GLMEventAccumulator(
             model=str(payload["model"]),
             allowed_tool_names=allowed_tool_names,
@@ -166,23 +260,59 @@ class GLMWebClient:
             debug_enabled=self.config.debug_dump_all,
             logger=self.logger,
         )
+        # Wire usage callbacks for search/tool tracking
+        _chat_account_index = self._last_account_index
+        auth_mgr2 = self.auth
+        def _on_search_chat():
+            auth_mgr2.record_search(_chat_account_index)
+            if auth_mgr2.is_near_quota_limit(_chat_account_index):
+                self.logger.info("账号 index=%s 接近配额限制 (search)，提前准备新账号", _chat_account_index)
+                auth_mgr2.prewarm_next_guest_slot()
+        def _on_tool_chat():
+            auth_mgr2.record_tool_call(_chat_account_index)
+            if auth_mgr2.is_near_quota_limit(_chat_account_index):
+                self.logger.info("账号 index=%s 接近配额限制 (tool)，提前准备新账号", _chat_account_index)
+                auth_mgr2.prewarm_next_guest_slot()
+        accumulator._on_search_callback = _on_search_chat
+        accumulator._on_tool_callback = _on_tool_chat
         try:
             for event in self._iter_sse_events(response):
                 if not event:
                     continue
                 status = event.get("status")
-                self._raise_for_event_error(event, stream=False)
+                last_error = event.get("last_error")
+                if status != "intervene" or not isinstance(last_error, dict):
+                    self._raise_for_event_error(event, stream=False)
                 accumulator.consume_event(event)
                 if status in {"finish", "intervene"}:
-                    return accumulator.build_response(), accumulator.conversation_id
+                    result = accumulator.build_response()
+                    self._record_usage(account_index, result)
+                    # Ponytail: upstream may return finish=stop with zero text
+                    # (e.g. upstream timeout or model refusal). Retry once with
+                    # a different account to avoid delivering empty responses.
+                    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    if not content and not result.get("choices", [{}])[0].get("message", {}).get("tool_calls"):
+                        self.logger.warning("上游返回空内容，使用新账号重试 account_index=%s", account_index)
+                        self.auth.advance_account(account_index, "empty_content")
+                        raise UpstreamAPIError(
+                            status_code=502,
+                            message="GLM 上游返回空内容，正在使用新账号重试",
+                        )
+                    return result, accumulator.conversation_id
         finally:
-            response.close() # type: ignore
-            self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
+            try:
+                response.close() # type: ignore
+            except Exception:
+                pass
+            try:
+                self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
+            except Exception:
+                pass
             lease.release()
         return accumulator.build_response(), accumulator.conversation_id
 
     def generate_images(self, payload: dict[str, object]) -> dict[str, object]:
-        lease = self.request_queue.acquire(f"image:{payload.get('model', self.config.glm_image_model_name)}")
+        lease = self.request_queue.acquire(f"image:{payload.get('model', self.config.glm_image_model_name)}", account_pool_size=self.auth.get_account_count())
         try:
             response, assistant_id = self._open_image_stream(payload, preferred_account_index=self._get_preferred_account_index(lease.ticket))
         except Exception:
@@ -205,13 +335,19 @@ class GLMWebClient:
 
             return self._build_images_response(payload, {}, accumulator)
         finally:
-            response.close() # type: ignore
-            self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
+            try:
+                response.close() # type: ignore
+            except Exception:
+                pass
+            try:
+                self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
+            except Exception:
+                pass
             lease.release()
 
     def stream_chat_completion(self, payload: dict[str, object]):
         _, allowed_tool_names = self._resolve_tools(payload)
-        lease = self.request_queue.acquire(f"stream:{payload.get('model', 'unknown')}")
+        lease = self.request_queue.acquire(f"stream:{payload.get('model', 'unknown')}", account_pool_size=self.auth.get_account_count())
         try:
             response, assistant_id = self._open_chat_stream(payload, preferred_account_index=self._get_preferred_account_index(lease.ticket))
         except Exception:
@@ -225,30 +361,62 @@ class GLMWebClient:
             debug_enabled=self.config.debug_dump_all,
             logger=self.logger,
         )
+        # Wire usage callbacks: track searches/tool calls via accumulator
+        _st_account_index = self._last_account_index
+        auth_mgr = self.auth
+        def _on_search():
+            auth_mgr.record_search(_st_account_index)
+            if auth_mgr.is_near_quota_limit(_st_account_index):
+                self.logger.info("账号 index=%s 接近配额限制 (search)，提前准备新账号", _st_account_index)
+                auth_mgr.prewarm_next_guest_slot()
+        def _on_tool():
+            auth_mgr.record_tool_call(_st_account_index)
+            if auth_mgr.is_near_quota_limit(_st_account_index):
+                self.logger.info("账号 index=%s 接近配额限制 (tool)，提前准备新账号", _st_account_index)
+                auth_mgr.prewarm_next_guest_slot()
+        accumulator._on_search_callback = _on_search
+        accumulator._on_tool_callback = _on_tool
 
         def generate():
             try:
                 for event in self._iter_sse_events(response):
                     if not event:
                         continue
-                    self._raise_for_event_error(event, stream=True)
-                    chunks, status = accumulator.consume_event(event)
+                    status = event.get("status")
+                    last_error = event.get("last_error")
+                    if status != "intervene" or not isinstance(last_error, dict):
+                        self._raise_for_event_error(event, stream=True)
+                    chunks, status2 = accumulator.consume_event(event)
+                    actual_status = status2 or status
                     for chunk in chunks:
-                        yield chunk.encode("utf-8")
+                        yield chunk
 
-                    if status in {"finish", "intervene"}:
+                    if actual_status in {"finish", "intervene"}:
+                        # On intervene (captcha/plan issue), invalidate this account's
+                        # cached token so the next request fetches fresh guest credentials.
+                        if actual_status == "intervene" and self.config.glm_use_guest_refresh_token:
+                            self.auth.record_silence(lease.ticket % self.auth.get_account_count())
+                            self.logger.warning("上游干预/账户失效，标记账号冷却并尝试全量刷新")
+                            if self.auth.is_starved():
+                                self.auth.force_refresh_all_guest_tokens()
                         for chunk in accumulator.finalize(
-                            status=status,
-                            last_error=event.get("last_error") if isinstance(event.get("last_error"), dict) else None,
+                            status=actual_status,
+                            last_error=last_error if isinstance(last_error, dict) else None,
                         ):
-                            yield chunk.encode("utf-8")
+                            yield chunk
                         return
 
                 for chunk in accumulator.finalize(status="stop"):
-                    yield chunk.encode("utf-8")
+                    yield chunk
             finally:
-                response.close() # type: ignore
-                self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
+                try:
+                    response.close() # type: ignore
+                except Exception:
+                    pass
+                try:
+                    self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
+                except Exception:
+                    pass
                 lease.release()
 
         return generate()
@@ -262,6 +430,9 @@ class GLMWebClient:
 
         error_payload: dict[str, object] = {}
         if isinstance(last_error, dict):
+            # intervene events are not real errors — skip raising
+            if last_error.get("intervene_text"):
+                return
             error_payload.update(last_error)
         if isinstance(event_error, dict):
             error_payload.update(event_error)
@@ -310,32 +481,37 @@ class GLMWebClient:
                 "conversation_id": conversation_id,
             }
         ).encode("utf-8")
-        try:
-            # Direct call — no account failover for cleanup ops.
-            # Guest conversations are ephemeral; delete failures are harmless.
-            timestamp, nonce, sign = build_sign()
-            request = urllib.request.Request(
-                self.config.delete_conversation_url,
-                method="POST",
-                data=body,
-                headers={
-                    **self.auth.get_browser_headers(),
-                    "Authorization": f"Bearer {self.auth.get_access_token()}",
-                    "Referer": "https://chatglm.cn/main/alltoolsdetail",
-                    "X-Device-Id": uuid.uuid4().hex,
-                    "X-Nonce": nonce,
-                    "X-Request-Id": uuid.uuid4().hex,
-                    "X-Sign": sign,
-                    "X-Timestamp": timestamp,
-                },
-            )
-            with urllib.request.urlopen(request, timeout=min(self.config.request_timeout, 10)) as response:
-                self.auth.read_json_response(response)
-            self.logger.debug("已删除 GLM 会话 conversation_id=%s", conversation_id)
-        except Exception:
-            pass  # best-effort cleanup, never retry
+        # ponytail: fire-and-forget — don't block the request on cleanup
+        _body = body
+        _logger = self.logger
+        _auth = self.auth
+        _config = self.config
+        def _do_delete():
+            try:
+                timestamp, nonce, sign = build_sign()
+                request = urllib.request.Request(
+                    _config.delete_conversation_url,
+                    method="POST",
+                    data=_body,
+                    headers={
+                        **_auth.get_browser_headers(),
+                        "Authorization": f"Bearer {_auth.get_access_token()}",
+                        "Referer": "https://chatglm.cn/main/alltoolsdetail",
+                        "X-Device-Id": uuid.uuid4().hex,
+                        "X-Nonce": nonce,
+                        "X-Request-Id": uuid.uuid4().hex,
+                        "X-Sign": sign,
+                        "X-Timestamp": timestamp,
+                    },
+                )
+                with _get_glm_opener().open(request, timeout=min(_config.request_timeout, 120)) as response:
+                    _auth.read_json_response(response)
+                _logger.debug("已删除 GLM 会话 conversation_id=%s", conversation_id)
+            except Exception:
+                pass  # best-effort cleanup, never retry
+        threading.Thread(target=_do_delete, daemon=True).start()
 
-    def _open_chat_stream(self, openai_payload: dict[str, object], preferred_account_index: int | None = None):
+    def _open_chat_stream(self, openai_payload: dict[str, object], preferred_account_index: int | None = None, lease: QueueLease | None = None):
         requested_model = str(openai_payload.get("model", "glm-4"))
         upstream_model, assistant_id = resolve_upstream_model(requested_model, self.config)
         filtered_tools, _ = self._resolve_tools(openai_payload)
@@ -348,7 +524,7 @@ class GLMWebClient:
         )
         if self.config.glm_use_guest_refresh_token:
             converted_messages = [
-                {"role": "user", "content": [{"type": "text", "text": "Reply exclusively in English. Do not use Chinese."}]},
+                {"role": "system", "content": [{"type": "text", "text": "Respond in English."}]},
                 *converted_messages,
             ]
         debug_dump(self.logger, self.config.debug_dump_all, "OpenAI 原始 chat 请求 payload", openai_payload)
@@ -370,43 +546,28 @@ class GLMWebClient:
 
 
 
-        # Ponytail: DDG search pre-fetch + direct prompt injection for guest search.
-        # Fires DDG search in parallel, then waits briefly for cached results and
-        # injects the *actual* search result text into the prompt so the model has
-        # search context immediately — even when upstream is_networking is unreliable
-        # for guest tokens.  This eliminates the ~22s tool-call-intercept path.
+        # NATIVE UPSTREAM SEARCH FIRST: GLM's built-in search (is_networking=True).
+        # DDG background prefetch as fallback when upstream fails / accounts exhaust.
         _prefetch_query = None
         _prefetch_search_results = None
-        _should_prefetch = (
-            not is_networking
-            or self.config.glm_use_guest_refresh_token
-            or "search" in requested_model.lower()
+        _should_search = (
+            is_networking or "search" in requested_model.lower()
         )
-        if _should_prefetch:
+        if _should_search and self.config.glm_use_guest_refresh_token:
+            _prefetch_account_idx = preferred_account_index if preferred_account_index is not None else self.auth.get_next_account_index()
+            self.auth.record_search(_prefetch_account_idx)
+            if self.auth.is_near_quota_limit(_prefetch_account_idx):
+                self.logger.info("搜索请求: 账号 %s 接近配额限制，提前准备新账号", _prefetch_account_idx)
+                self.auth.prewarm_next_guest_slot()
+        # Background DDG prefetch for fallback (cached for _execute_retrieve_tool_calls)
+        if _should_search:
             for msg in openai_payload.get("messages", []):
                 if isinstance(msg, dict) and msg.get("role") == "user":
                     user_text = extract_text_content(msg.get("content"))
-                    if user_text and len(user_text.strip()) > 10:
+                    if user_text and user_text.strip():
                         _prefetch_query = user_text.strip()
                         _cache_search_query(_prefetch_query)
-                        # Wait up to 8s for the background DDG fetch to populate the cache
-                        _prefetch_search_results = _wait_for_search_result(_prefetch_query, timeout=8.0)
                         break
-
-        # If search model variant and we have actual DDG results, inject them as
-        # a user message before the conversation.  This gives the model immediate
-        # search context without needing upstream is_networking/tool-call interception.
-        # ponytail: DDG pre-fetch succeeded → inject results into prompt, disable
-        # is_networking AND use non-search assistant so upstream treats it as a plain
-        # chat.  This avoids the ~22-70s tool-call-intercept + verbose output path.
-        if _prefetch_search_results and ("search" in requested_model.lower() or is_networking):
-            search_msg = {
-                "role": "user",
-                "content": [{"type": "text", "text": _prefetch_search_results}]
-            }
-            converted_messages = [search_msg] + list(converted_messages)
-            is_networking = False          # ponytail: DDG already in prompt
-            upstream_model, _ = resolve_upstream_model(requested_model, self.config)  # strips -search
 
 
         request_body = json.dumps(
@@ -441,7 +602,7 @@ class GLMWebClient:
         )
         debug_dump(self.logger, self.config.debug_dump_all, "转发到 GLM 的 chat 原始请求体", request_body)
 
-        def send_request(account_index: int, access_token: str):
+        def send_request(account_index: int, access_token: str, lease: QueueLease | None = None):
             for attempt in range(self.config.glm_busy_max_retries + 1):
                 try:
                     timestamp, nonce, sign = build_sign()
@@ -466,12 +627,25 @@ class GLMWebClient:
                         dict(request.header_items()),
                     )
                     return self._prepare_chat_response(
-                        urllib.request.urlopen(request, timeout=self.config.request_timeout)
+                        # ponytail: if hangs persist, reduce self.config.request_timeout below 90
+                        _get_glm_opener().open(request, timeout=self.config.request_timeout)
                     )
                 except urllib.error.HTTPError as exc:
                     error_payload = self._read_error_payload(exc)
-                    if self._should_retry_busy_error(exc.code, error_payload) and attempt < self.config.glm_busy_max_retries:
-                        wait_seconds = self.config.glm_busy_retry_interval
+                    # ponytail: handle rate limit (429) by rotating to a new proxy immediately
+                    if exc.code == 429 or (error_payload and "too many" in str(error_payload).lower()):
+                        self.logger.warning(
+                            "GLM 速率限制 (%s), 立即黑名单当前代理并轮换 attempt=%s/%s account=%s",
+                            exc.code, attempt + 1, self.config.glm_busy_max_retries, account_index
+                        )
+                        # Immediately blacklist current proxy so next call picks a different one
+                        from .glm2api_proxy import get_pool
+                        pool = get_pool()
+                        if pool._current:
+                            pool.report_rate_limited(pool._current)
+                        wait_seconds = self.config.glm_busy_retry_interval * (attempt + 1)
+                    elif self._should_retry_busy_error(exc.code, error_payload) and attempt < self.config.glm_busy_max_retries:
+                        wait_seconds = self.config.glm_busy_retry_interval * (attempt + 1)  # ponytail: exponential backoff 2,4,6,8,10s
                         self.logger.warning(
                             "GLM 正在处理其他对话，等待重试 attempt=%s/%s wait=%.1fs account=%s",
                             attempt + 1,
@@ -479,6 +653,7 @@ class GLMWebClient:
                             wait_seconds,
                             account_index,
                         )
+                        # Keep the lease during sleep — the slot is still 'ours', just waiting for upstream
                         time.sleep(wait_seconds)
                         continue
 
@@ -491,6 +666,7 @@ class GLMWebClient:
             f"chat:{requested_model}",
             send_request,
             preferred_account_index=preferred_account_index,
+            lease=lease,
         )
         return response, assistant_id
 
@@ -569,7 +745,7 @@ class GLMWebClient:
                 dict(request.header_items()),
             )
             try:
-                return self._prepare_chat_response(urllib.request.urlopen(request, timeout=self.config.request_timeout))
+                return self._prepare_chat_response(_get_glm_opener().open(request, timeout=self.config.request_timeout))
             except urllib.error.HTTPError as exc:
                 error_payload = self._read_error_payload(exc)
                 message = self._build_error_message(exc.code, error_payload)
@@ -589,7 +765,8 @@ class GLMWebClient:
             debug_dump(self.logger, self.config.debug_dump_all, "GLM 非流式原始 JSON 响应", payload)
             status = payload.get("status")
             message = str(payload.get("message", "")).strip()
-            if status not in (0, None) or message:
+            # GLM returns status=0, message="ok" for success
+            if status is not None and status != 0:
                 raise UpstreamAPIError(
                     status_code=502,
                     message=self._build_error_message(200, payload),
@@ -693,36 +870,77 @@ class GLMWebClient:
 
     def _download_image_as_base64(self, image_url: str) -> str:
         try:
-            with urllib.request.urlopen(image_url, timeout=self.config.request_timeout) as response:
+            with _get_glm_opener().open(image_url, timeout=self.config.request_timeout) as response:
                 image_bytes = response.read()
             return base64.b64encode(image_bytes).decode("ascii")
         except Exception as exc:
             raise UpstreamAPIError(status_code=502, message=f"下载图片失败: {image_url} error={exc}") from exc
 
-    def _iter_sse_events(self, response):
-        pending = ""
-        decoder = codecs.getincrementaldecoder("utf-8")("ignore")
+    def _iter_sse_events(self, response, stream_timeout: int = 0):
+        # Set socket read timeout on the response to detect upstream silence
+        if stream_timeout <= 0:
+            stream_timeout = STREAM_READ_TIMEOUT
+        try:
+            sock = None
+            # Try all plausible socket access paths for urllib responses
+            for attr_path in [('fp', 'raw', '_sock'), ('fp', 'buf', 'raw', '_sock'), ('fp', '_sock')]:
+                obj = response
+                try:
+                    for a in attr_path:
+                        obj = getattr(obj, a)
+                    sock = obj
+                    break
+                except AttributeError:
+                    continue
+            if sock is not None:
+                sock.settimeout(stream_timeout)
+                self.logger.debug("设置 SSE 读取超时=%ss (sock=%s)", stream_timeout, type(sock).__name__)
+        except Exception:
+            pass
 
-        def emit_block(block: str):
-            lines = [line for line in block.split("\n") if line.startswith("data:")]
-            if not lines:
-                return None
-            payload = "\n".join(line[5:].strip() for line in lines)
-            debug_dump(self.logger, self.config.debug_dump_all, "GLM 原始 SSE block", block)
+        pending = b""
+        _READ_SIZE = 16384  # Ponytail: 16KB buffer — better throughput, still low latency
+        last_data_time = time.monotonic()
+
+        def emit_block(payload: str):
+            debug_dump(self.logger, self.config.debug_dump_all, "GLM SSE payload", payload)
             if payload == "[DONE]":
                 return "[DONE]"
             try:
                 parsed = json.loads(payload)
-                debug_dump(self.logger, self.config.debug_dump_all, "GLM 解析后的 SSE payload", parsed)
                 return parsed
             except json.JSONDecodeError:
-                self.logger.debug("忽略无法解析的 SSE 片段: %s", payload)
+                self.logger.debug("忽略无法解析的 SSE 片段: %s", payload[:200])
                 return None
 
         while True:
             stop_after_chunk = False
             try:
-                raw_chunk = response.read(4096)
+                try:
+                    fileno = None
+                    for f in [response, getattr(response, "fp", None), getattr(getattr(response, "fp", None), "raw", None)]:
+                        if hasattr(f, "fileno"):
+                            fileno = f.fileno()
+                            break
+                    if fileno is not None:
+                        r, _, _ = select.select([fileno], [], [], stream_timeout)
+                        if not r:
+                            raise UpstreamAPIError(
+                                status_code=504,
+                                message=f"上游无响应 (SSE 读取超时 {stream_timeout}s)"
+                            )
+                except (OSError, AttributeError, ValueError):
+                    pass
+                raw_chunk = response.read(_READ_SIZE)
+                if raw_chunk:
+                    last_data_time = time.monotonic()
+            except socket.timeout:
+                elapsed = time.monotonic() - last_data_time
+                self.logger.warning("上游 SSE 读取超时 (%.0fs 无数据)", elapsed)
+                raise UpstreamAPIError(
+                    status_code=504,
+                    message=f"上游无响应 (SSE 读取超时 {stream_timeout}s)"
+                )
             except http.client.IncompleteRead as exc:
                 raw_chunk = exc.partial or b""
                 stop_after_chunk = True
@@ -730,30 +948,35 @@ class GLMWebClient:
             if not raw_chunk:
                 break
 
-            pending += decoder.decode(raw_chunk, False).replace("\r\n", "\n")
+            pending += raw_chunk
 
-            while "\n\n" in pending:
-                block, pending = pending.split("\n\n", 1)
-                event = emit_block(block.strip())
-                if event == "[DONE]":
-                    return
-                if event is not None:
-                    yield event
+            while b"\n\n" in pending:
+                block_bytes, pending = pending.split(b"\n\n", 1)
+                block = block_bytes.decode("utf-8", errors="ignore").replace("\r\n", "\n")
+                for line in block.split("\n"):
+                    if line.startswith("data:"):
+                        payload = line[5:].strip()
+                        event = emit_block(payload)
+                        if event == "[DONE]":
+                            return
+                        if event is not None:
+                            yield event
 
             if stop_after_chunk:
                 break
 
-        remaining = decoder.decode(b"", True)
-        if remaining:
-            pending += remaining
-
         if pending.strip():
-            event = emit_block(pending.strip())
-            if event not in (None, "[DONE]"):
-                yield event
+            remaining = pending.decode("utf-8", errors="ignore")
+            for line in remaining.split("\n"):
+                if line.startswith("data:"):
+                    payload = line[5:].strip()
+                    event = emit_block(payload)
+                    if event not in (None, "[DONE]"):
+                        yield event
 
     def _upload_referenced_files(self, messages: list[dict[str, object]]) -> list[dict[str, object]]:
         refs: list[dict[str, object]] = []
+        upload_tasks: list[tuple[str, bool]] = []
         for message in messages:
             content = message.get("content")
             if not isinstance(content, list):
@@ -765,15 +988,28 @@ class GLMWebClient:
                 if item_type == "image_url":
                     url = item.get("image_url", {}).get("url")
                     if isinstance(url, str) and url:
-                        ref = self._upload_file_reference(url, is_image=True)
-                        if ref:
-                            refs.append(ref)
+                        upload_tasks.append((url, True))
                 elif item_type == "file":
                     url = item.get("file_url", {}).get("url")
                     if isinstance(url, str) and url:
-                        ref = self._upload_file_reference(url, is_image=False)
+                        upload_tasks.append((url, False))
+        
+        # ponytail: parallelize file uploads for faster processing
+        if upload_tasks:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=min(len(upload_tasks), 10)) as executor:
+                futures = {
+                    executor.submit(self._upload_file_reference, url, is_image): url
+                    for url, is_image in upload_tasks
+                }
+                for future in as_completed(futures):
+                    try:
+                        ref = future.result()
                         if ref:
                             refs.append(ref)
+                    except Exception as exc:
+                        self.logger.warning("上传附件失败 url=%s error=%s", futures[future], exc)
+        
         if refs:
             self.logger.info("上传附件完成 成功数=%s", len(refs))
         return refs
@@ -821,7 +1057,7 @@ class GLMWebClient:
                     f"转发到 GLM 的 file_upload 原始请求体 account={account_index}",
                     body,
                 )
-                return urllib.request.urlopen(request, timeout=self.config.request_timeout)
+                return _get_glm_opener().open(request, timeout=self.config.request_timeout)
 
             with self._call_with_account_failover("file_upload", send_request) as response: # type: ignore
                 result = self.auth.read_json_response(response).get("result", {})
@@ -847,7 +1083,7 @@ class GLMWebClient:
 
         parsed = urllib.parse.urlparse(file_url)
         filename = parsed.path.rsplit("/", 1)[-1] or f"upload-{uuid.uuid4().hex}.bin"
-        with urllib.request.urlopen(file_url, timeout=self.config.request_timeout) as response:
+        with _get_glm_opener().open(file_url, timeout=self.config.request_timeout) as response:
             payload = response.read(FILE_SIZE_LIMIT + 1)
             if len(payload) > FILE_SIZE_LIMIT:
                 raise ValueError("文件超过 100MB，拒绝上传。")
@@ -920,25 +1156,51 @@ class GLMWebClient:
         request_name: str,
         operation: Callable[[int, str], object],
         preferred_account_index: int | None = None,
+        lease: QueueLease | None = None,
     ):
         account_count = self.auth.get_account_count()
         if account_count <= 0:
             raise RuntimeError("没有可用的 GLM 账号或游客 token 配置")
-        start_index = preferred_account_index % account_count if preferred_account_index is not None else self.auth.get_current_account_index()
+        start_index = preferred_account_index % account_count if preferred_account_index is not None else self.auth.get_next_account_index()
         last_exc: Exception | None = None
 
         for offset in range(account_count):
             account_index = (start_index + offset) % account_count
+            # ponytail: skip accounts without cached tokens on first pass to avoid slow token refreshes
+            if not self.auth.has_cached_token(account_index):
+                continue
             guest_retry_limit = self.config.glm_guest_max_retries if self.auth.is_guest_account(account_index) else 0
             for attempt in range(guest_retry_limit + 1):
                 try:
                     access_token = self.auth.get_access_token_for_account(account_index)
-                    return operation(account_index, access_token)
+                    self._last_account_index = account_index
+                    import time as _tm
+                    _op_start = _tm.time()
+                    result = operation(account_index, access_token, lease)
+                    _op_elapsed = (_tm.time() - _op_start) * 1000
+                    self.auth.record_latency(account_index, _op_elapsed)
+                    self.auth.clear_account_failures(account_index)
+                    self.auth.record_success()
+                    return result
                 except Exception as exc:
                     last_exc = exc
+                    err_str = str(exc).lower()
+                    # ponytail: on SSL errors, rotate proxy immediately
+                    if "ssl" in err_str or "certificate" in err_str or "eof" in err_str:
+                        from .glm2api_proxy import get_pool as _get_pool
+                        _pool = _get_pool()
+                        if _pool._current:
+                            _pool.report_rate_limited(_pool._current)
+                            self.logger.warning("SSL错误, 立即黑名单当前代理 account=%s error=%s", account_index, str(exc)[:80])
+                    is_quota_limited = any(kw in err_str for kw in ("多次体验", "请登录", "登录后继续", "rate limit", "too many requests", "频繁"))
+                    if is_quota_limited and hasattr(self.auth, "mark_rate_limited"):
+                        self.auth.mark_rate_limited(account_index)
+                        break
                     should_switch = self.auth.should_switch_account(exc)
                     if should_switch:
                         self.auth.invalidate_account(account_index)
+                        # Circuit breaker: track failures, auto-blacklist after threshold
+                        self.auth.track_account_failure(account_index)
                     if should_switch and attempt < guest_retry_limit:
                         self.logger.warning(
                             "游客账号请求失败，重新获取游客 ck 重试 attempt=%s/%s request=%s account=%s error=%s",
@@ -954,6 +1216,26 @@ class GLMWebClient:
                     self.auth.advance_account(account_index, f"{request_name}: {exc}")
                     break
 
+        # Ponytail: guest pool exhausted -- spawn a fresh account on the fly
+        # instead of failing.  Each fresh spawn gets ~5 more searches.
+        if self.config.glm_use_guest_refresh_token and last_exc is not None:
+            try:
+                fresh_idx = self.auth.spawn_fresh_guest_account()
+                self.logger.info("游客池耗尽，动态创建新账号 index=%s request=%s", fresh_idx, request_name)
+                self.auth.reset_account_cycle()
+                access_token = self.auth.get_access_token_for_account(fresh_idx)
+                return operation(fresh_idx, access_token)
+            except Exception as spawn_exc:
+                self.logger.warning("动态创建新游客账号也失败 request=%s error=%s", request_name, spawn_exc)
+                raise last_exc from spawn_exc
+
+        if hasattr(self.auth, "force_refresh_all_guest_tokens"):
+            self.logger.warning("所有账号耗尽，强制刷新游客 token request=%s", request_name)
+            self.auth.force_refresh_all_guest_tokens()
+            try:
+                return operation(0, self.auth.get_access_token_for_account(0))
+            except Exception as exc:
+                last_exc = exc
         self.auth.reset_account_cycle()
         if last_exc is not None:
             raise last_exc

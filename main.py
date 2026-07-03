@@ -1,13 +1,10 @@
+#!/usr/bin/env python3
+"""Entry point for glm2api server. Adds src/ to path if editable install isn't picked up."""
+import os, sys
+_here = os.path.dirname(os.path.abspath(__file__))
+_src = os.path.join(_here, "src")
+if os.path.isdir(_src) and _src not in sys.path:
+    sys.path.insert(0, _src)
 from glm2api.__main__ import main
-
-
 if __name__ == "__main__":
-    print("\n📢 【重要公告】")
-    print("-" * 30)
-    print("如果你在使用本项目时遇到了 Bug...")
-    print("👉 欢迎加入我们的官方摸鱼大队 👈")
-    print("🐧 QQ群号: 1081291958")
-    print("-" * 30 + "\n")
-    
-    print("🚀 正在启动 GLM2API...！")
     raise SystemExit(main())

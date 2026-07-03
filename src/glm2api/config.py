@@ -202,6 +202,11 @@ def load_config(env_file: str = ".env") -> AppConfig:
     env_path = Path(env_file)
     env_file_created = ensure_env_file(env_path)
     file_values = parse_dotenv(env_path)
+    # ponytail: push .env values into os.environ so downstream modules
+    # (e.g. glm2api_proxy which reads GLM_PROXY_LIST from os.environ) see them
+    for k, v in file_values.items():
+        if k not in os.environ:
+            os.environ[k] = v
     values = {**file_values, **os.environ}
 
     glm_max_concurrency = max(1, parse_int(values.get("GLM_MAX_CONCURRENCY"), 3))
@@ -269,8 +274,8 @@ def load_config(env_file: str = ".env") -> AppConfig:
         ).strip(),
         glm_delete_conversation=parse_bool(values.get("GLM_DELETE_CONVERSATION"), True),
         glm_max_concurrency=glm_max_concurrency,
-        glm_queue_wait_timeout=parse_int(values.get("GLM_QUEUE_WAIT_TIMEOUT_SECONDS"), 600),
-        glm_busy_max_retries=parse_int(values.get("GLM_BUSY_MAX_RETRIES"), 30),
+	        glm_queue_wait_timeout=parse_int(values.get("GLM_QUEUE_WAIT_TIMEOUT_SECONDS"), 120),
+	        glm_busy_max_retries=parse_int(values.get("GLM_BUSY_MAX_RETRIES"), 5),
         glm_busy_retry_interval=parse_float(values.get("GLM_BUSY_RETRY_INTERVAL_SECONDS"), 2.0),
         glm_guest_max_retries=max(0, parse_int(values.get("GLM_GUEST_MAX_RETRIES"), 3)),
         blocked_tool_names=parse_list(values.get("BLOCKED_TOOL_NAMES"), DEFAULT_BLOCKED_TOOL_NAMES),

@@ -8,6 +8,18 @@ from dataclasses import dataclass, field
 
 from .tool_protocol import BLOCKED_NATIVE_TOOL_NAMES
 
+# Strip model apology loops before tool calls (e.g. "I apologize, let me use...").
+# GLM inserts this chatter after blocked tool calls, wasting tokens + confusing parsers.
+TOOL_CHATTER_PATTERN = re.compile(
+    r"(?is)"
+    r"(?:the\s+open_url\s+tool\s+is\s+not\s+available.*?|"
+    r"let\s+me\s+use\s+the\s+correct.*?|"
+    r"i\s+apologize\s+for\s+the\s+repeated.*?|"
+    r"the\s+tool\s+open_url\s+appears\s+to\s+be\s+blocked.*?|"
+    r"open_url\u5de5\u5177\u88ab\u963b\u6b62.*?)(?=<(?:ml_)?tool_calls\b)"
+)
+
+
 CODE_FENCE_PATTERN = re.compile(r"```[\s\S]*?```")
 TOOL_RESULT_PATTERN = re.compile(
     r"<(?:(?:\|DSML\|)|ml_)?tool_result\b[\s\S]*?</(?:(?:\|DSML\|)|ml_)?tool_result>",
@@ -44,40 +56,13 @@ DSML_TOOL_CALLS_TRAILING_CLOSE_PATTERN = re.compile(
 )
 PARAM_NAME_TAG_PATTERN = re.compile(r"<param_name>\s*(.*?)\s*</param_name>", re.IGNORECASE | re.DOTALL)
 PARAM_VALUE_TAG_PATTERN = re.compile(r"<param_value>\s*(.*?)\s*</param_value>", re.IGNORECASE | re.DOTALL)
-TAG_NAME_HINTS = [
-    "<|",
-    "</|",
-    "<|DSML|",
-    "</|DSML|",
-    "<|DSML|tool_calls",
-    "</|DSML|tool_calls",
-    "<|DSML|invoke",
-    "</|DSML|invoke",
-    "<|DSML|parameter",
-    "</|DSML|parameter",
-    "<|DSML|tool_result",
-    "</|DSML|tool_result",
-    "<m",
-    "</m",
-    "<ml_",
-    "</ml_",
-    "<ml_tool_calls",
-    "</ml_tool_calls",
-    "<ml_tool_call",
-    "</ml_tool_call",
-    "<ml_tool_name",
-    "</ml_tool_name",
-    "<ml_parameters",
-    "</ml_parameters",
-    "<ml_tool_result",
-    "</ml_tool_result",
-    "<tool_calls",
-    "</tool_calls",
-    "<invoke",
-    "</invoke",
-    "<parameter",
-    "</parameter",
-]
+
+# Match complete <|DSML|invoke ...> ... </|DSML|invoke> blocks (early streaming detection)
+# After _repair_malformed_dsml normalization, tags are canonical
+INVOKE_COMPLETE_PATTERN = re.compile(
+    r"<\|DSML\|invoke\s+[^>]+>.*?</\|DSML\|invoke\s*>",
+    re.DOTALL,
+)
 
 
 def _local_name(tag: str) -> str:
@@ -441,100 +426,9 @@ def _remove_spans(text: str, spans: list[tuple[int, int]], *, trim_outer_whitesp
     cleaned = "".join(parts)
     cleaned = TOOL_RESULT_PATTERN.sub("", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    # Strip model apology loops before tool calls (TOOL_CHATTER_PATTERN)
+    cleaned = TOOL_CHATTER_PATTERN.sub("", cleaned)
     return cleaned.strip() if trim_outer_whitespace else cleaned
-
-
-def _find_unmatched_fence_start(text: str) -> int | None:
-    last_open = None
-    cursor = 0
-    while True:
-        index = text.find("```", cursor)
-        if index == -1:
-            break
-        if last_open is None:
-            last_open = index
-        else:
-            last_open = None
-        cursor = index + 3
-    return last_open
-
-
-def _find_incomplete_block_start(text: str, *, allow_trailing_close: bool = False) -> int | None:
-    masked_text = _mask_code_fences(text)
-    cursor = 0
-    while cursor < len(masked_text):
-        match = START_TAG_PATTERN.search(masked_text, cursor)
-        if match is None:
-            break
-        span = _find_matching_block(masked_text, match, allow_trailing_close=allow_trailing_close)
-        if span is None:
-            return match.start()
-        cursor = span[1]
-    return None
-
-
-def _find_partial_tag_start(text: str) -> int | None:
-    lowered_text = text.lower()
-    pipe_tag_start = lowered_text.rfind("<|")
-    if pipe_tag_start != -1 and ">" not in lowered_text[pipe_tag_start:]:
-        return pipe_tag_start
-    for hint in TAG_NAME_HINTS:
-        lowered_hint = hint.lower()
-        max_overlap = min(len(hint), len(text))
-        for size in range(max_overlap, 0, -1):
-            if lowered_text.endswith(lowered_hint[:size]):
-                return len(text) - size
-    return None
-
-
-def _looks_like_tool_markup_fragment(text: str) -> bool:
-    stripped = text.strip()
-    lowered = stripped.lower()
-    if not stripped:
-        return False
-    if lowered.startswith("<|dsml|") or lowered.startswith("</|dsml|") or lowered.startswith("<|/dsml"):
-        return True
-    if stripped.startswith("<ml_") or stripped.startswith("</ml_"):
-        return True
-    if stripped.startswith("<tool_") or stripped.startswith("</tool_"):
-        return True
-    if stripped.startswith("<invoke") or stripped.startswith("</invoke"):
-        return True
-    if stripped.startswith("<parameter") or stripped.startswith("</parameter"):
-        return True
-    if stripped.startswith("<m") and any(token in stripped for token in ("ml_", "tool_", "tool_calls", "tool_result")):
-        return True
-    return False
-
-
-def _split_stream_text(
-    text: str,
-    allowed_tool_names: set[str] | None,
-    final: bool,
-) -> tuple[str, str, list[dict[str, object]]]:
-    hold_from_candidates = [
-        index
-        for index in (_find_unmatched_fence_start(text), _find_incomplete_block_start(text, allow_trailing_close=final))
-        if index is not None
-    ]
-
-    if not final:
-        partial_start = _find_partial_tag_start(text)
-        if partial_start is not None:
-            hold_from_candidates.append(partial_start)
-
-    if final:
-        safe_end = min(hold_from_candidates) if hold_from_candidates else len(text)
-    elif hold_from_candidates:
-        safe_end = min(hold_from_candidates)
-    else:
-        safe_end = len(text)
-
-    processable = text[:safe_end]
-    remainder = text[safe_end:]
-    spans, tool_calls = _extract_tool_blocks(processable, allowed_tool_names, allow_trailing_close=final)
-    visible = _remove_spans(processable, spans, trim_outer_whitespace=final)
-    return visible, remainder, tool_calls
 
 
 def parse_tool_calls_from_text(text: str, allowed_tool_names: set[str] | None = None) -> tuple[str, list[dict[str, object]]]:
@@ -544,32 +438,193 @@ def parse_tool_calls_from_text(text: str, allowed_tool_names: set[str] | None = 
     return _remove_spans(text, spans), tool_calls
 
 
+# ---------------------------------------------------------------------------
+# Early invoke extraction — emit tool calls during streaming (not just at finalize)
+# ---------------------------------------------------------------------------
+
+def _has_unclosed_outer_block(text: str) -> bool:
+    """Check if text contains an unclosed <|DSML|tool_calls> opening tag."""
+    masked = _mask_code_fences(text)
+    start_match = START_TAG_PATTERN.search(masked)
+    if start_match is None:
+        return False
+    span = _find_matching_block(masked, start_match, allow_trailing_close=False)
+    return span is None  # Opening tag found but no matching close
+
+
+def _extract_early_invoke_tool_calls(
+    text: str,
+    allowed_tool_names: set[str] | None,
+    already_emitted_ends: set[int],
+) -> tuple[list[tuple[int, int]], list[dict[str, object]]]:
+    """Find complete <|DSML|invoke>...</|DSML|invoke> blocks inside an unclosed outer block.
+
+    Returns (spans_to_mark_emitted, new_tool_calls).
+    Used during streaming to emit tool calls before the outer </|DSML|tool_calls> arrives.
+    """
+    if not _has_unclosed_outer_block(text):
+        return [], []
+
+    normalized = _repair_malformed_dsml(text)
+    new_spans: list[tuple[int, int]] = []
+    new_calls: list[dict[str, object]] = []
+
+    for match in INVOKE_COMPLETE_PATTERN.finditer(normalized):
+        end = match.end()
+        if end in already_emitted_ends:
+            continue
+
+        block = match.group(0)
+        block_calls, _ = _parse_xml_block(block, allowed_tool_names, 0)
+        if block_calls:
+            new_spans.append((match.start(), end))
+            new_calls.extend(block_calls)
+
+    return new_spans, new_calls
+
+
+# ---------------------------------------------------------------------------
+# Helper: detect partial DSML tags at buffer end (streaming)
+# ---------------------------------------------------------------------------
+
+def _is_partial_dsml_tag(text: str) -> int | None:
+    """Find position of an unclosed DSML-like tag at buffer end.
+
+    Returns the index to hold from, or None if no partial tag detected.
+    Used to avoid emitting fragments of DSML markup as visible text.
+
+    Covers three cases:
+      1. Bare `<` at end — could start any DSML tag (1-char prefix of <|, <m, <tool_, etc.)
+      2. Partial tag name without `>` — e.g. `<|DSML|tool_calls` (no > yet)
+      3. Complete opening tag without matching close — e.g. `<ml_tool_calls>` alone
+    """
+    lowered = text.lower()
+
+    # Priority 1: Complete opening tag without matching close.
+    # e.g. `<ml_tool_calls>` with no `</ml_tool_calls>` yet.
+    # Check BEFORE bare-< below so incomplete-block wins over trailing <.
+    masked = _mask_code_fences(text)
+    start_match = START_TAG_PATTERN.search(masked)
+    if start_match is not None:
+        span = _find_matching_block(masked, start_match, allow_trailing_close=False)
+        if span is None:
+            return start_match.start()
+
+    # Priority 2: Bare < at end — could start any DSML tag.
+    if text.endswith("<"):
+        return len(text) - 1
+
+    # Priority 3: Unclosed tag name (opening <|, <m, etc. with no > yet).
+    for prefix in ("<|", "<m", "</m", "<tool_", "</tool_", "<invoke", "</invoke", "<parameter", "</parameter"):
+        idx = lowered.rfind(prefix)
+        if idx != -1 and ">" not in text[idx:]:
+            return idx
+
+    return None
+
+
+def _clean_visible(text: str) -> str:
+    """Strip model chatter and tool_result blocks from visible text."""
+    cleaned = TOOL_CHATTER_PATTERN.sub("", text)
+    cleaned = TOOL_RESULT_PATTERN.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Streaming tool parser — state machine
+# ---------------------------------------------------------------------------
+
 @dataclass
 class StreamingToolParser:
+    """Streaming parser for DSML tool calls.
+
+    Three-state machine:
+      IDLE -> IN_DSML (on opening tag) -> IDLE (on matching close tag)
+      Text outside DSML blocks is passed through as visible.
+      Text inside DSML blocks is held until block completes, then parsed.
+
+    Ponytail: no regex soup. Uses _extract_tool_blocks for complete blocks
+    and _is_partial_dsml_tag to avoid leaking partial markup.
+    """
     pending_text: str = ""
     tool_calls: list[dict[str, object]] = field(default_factory=list)
     allowed_tool_names: set[str] | None = None
+    # Tracks already-emitted invoke block ends (for early streaming extraction)
+    _emitted_invoke_ends: set[int] = field(default_factory=set)
 
     def consume(self, chunk: str) -> str:
+        """Feed a streaming text chunk. Returns visible (non-DSML) text."""
         if not chunk:
             return ""
         self.pending_text += chunk
-        visible, remainder, parsed_calls = _split_stream_text(
-            self.pending_text,
-            allowed_tool_names=self.allowed_tool_names,
-            final=False,
+
+        # 1. Look for complete DSML blocks (outer <|DSML|tool_calls> closed)
+        spans, new_calls = _extract_tool_blocks(
+            self.pending_text, self.allowed_tool_names, allow_trailing_close=False
         )
-        self.pending_text = remainder
-        self.tool_calls.extend(parsed_calls)
-        return visible
+
+        if spans:
+            # Complete blocks found. Emit text outside all blocks.
+            visible_parts: list[str] = []
+            cursor = 0
+            for start, end in spans:
+                if start > cursor:
+                    visible_parts.append(self.pending_text[cursor:start])
+                cursor = end
+
+            # Remaining text after last block — check for partial new DSML tag
+            remaining = self.pending_text[cursor:]
+            partial_pos = _is_partial_dsml_tag(remaining)
+            if partial_pos is not None:
+                visible_parts.append(remaining[:partial_pos])
+                self.pending_text = remaining[partial_pos:]
+            else:
+                visible_parts.append(remaining)
+                self.pending_text = ""
+
+            # Deduplicate: only add new calls not already emitted via early extraction
+            for tc in new_calls:
+                if tc["id"] not in {e["id"] for e in self.tool_calls}:
+                    self.tool_calls.append(tc)
+            return _clean_visible("".join(visible_parts))
+
+        # 1b. Early invoke extraction: complete <|DSML|invoke> inside unclosed outer block.
+        #     These get emitted immediately so the client sees tool calls during streaming.
+        invoke_spans, early_calls = _extract_early_invoke_tool_calls(
+            self.pending_text, self.allowed_tool_names, self._emitted_invoke_ends
+        )
+        if early_calls:
+            for tc in early_calls:
+                tc["index"] = len(self.tool_calls)
+                self.tool_calls.append(tc)
+                self._emitted_invoke_ends.update(end for _, end in invoke_spans)
+
+        # 2. No complete blocks. Check for partial (incoming) DSML tag.
+        partial_pos = _is_partial_dsml_tag(self.pending_text)
+        if partial_pos is not None:
+            visible = self.pending_text[:partial_pos]
+            self.pending_text = self.pending_text[partial_pos:]
+            return _clean_visible(visible)
+
+        # 3. No DSML content at all — emit everything.
+        visible = self.pending_text
+        self.pending_text = ""
+        return _clean_visible(visible)
 
     def flush(self) -> tuple[str, list[dict[str, object]]]:
-        visible, remainder, parsed_calls = _split_stream_text(
-            self.pending_text,
-            allowed_tool_names=self.allowed_tool_names,
-            final=True,
+        """Finalize. Returns (remaining_visible_text, all_tool_calls)."""
+        if not self.pending_text.strip():
+            return "", self.tool_calls
+
+        cleaned, remaining_calls = parse_tool_calls_from_text(
+            self.pending_text.strip(), self.allowed_tool_names
         )
+        # Deduplicate: only add calls not already emitted via early extraction
+        emitted_ids = {tc["id"] for tc in self.tool_calls}
+        for tc in remaining_calls:
+            if tc["id"] not in emitted_ids:
+                self.tool_calls.append(tc)
         self.pending_text = ""
-        self.tool_calls.extend(parsed_calls)
-        tail = "" if _looks_like_tool_markup_fragment(remainder) else remainder
-        return (visible + tail).strip(), self.tool_calls
+        self._emitted_invoke_ends.clear()
+        return cleaned.strip(), self.tool_calls

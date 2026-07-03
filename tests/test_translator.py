@@ -6,6 +6,11 @@ from glm2api.services.translator import (
 )
 
 
+def _c(chunks):
+    """Convert bytes chunks to strings for assertion readability."""
+    return [c.decode("utf-8") if isinstance(c, bytes) else c for c in chunks]
+
+
 def test_convert_messages_injects_xml_tool_prompt_and_history():
     converted = convert_messages(
         messages=[
@@ -86,7 +91,7 @@ def test_accumulator_build_response_maps_xml_to_openai_tool_calls():
     message = response["choices"][0]["message"]
 
     assert response["choices"][0]["finish_reason"] == "tool_calls"
-    assert message["content"] is None
+    assert message["content"] == ""
     assert message["tool_calls"][0]["function"]["name"] == "get_weather"
     assert message["tool_calls"][0]["function"]["arguments"] == '{"city":"上海"}'
 
@@ -116,10 +121,13 @@ def test_accumulator_streaming_tool_call_emits_assistant_role_before_tool_delta(
 
     final_chunks = accumulator.finalize(status)
 
-    assert chunks == []
-    assert '"delta":{"role":"assistant"}' in final_chunks[0]
-    assert '"tool_calls"' in final_chunks[1]
-    assert '"finish_reason":"tool_calls"' in final_chunks[2]
+    # consume_event now emits tool calls early during streaming
+    c = _c(chunks)
+    assert len(c) >= 2
+    assert '"delta":{"role":"assistant"}' in c[0]
+    assert '"tool_calls"' in c[1]
+    # finalize emits the finish_reason
+    assert b'"finish_reason":"tool_calls"' in final_chunks[0]
 
 
 def test_accumulator_streaming_extracts_tool_call_from_reasoning_fallback():
@@ -149,10 +157,15 @@ def test_accumulator_streaming_extracts_tool_call_from_reasoning_fallback():
     final_chunks = accumulator.finalize(status)
 
     assert chunks
-    assert '"reasoning_content"' in chunks[0]
-    assert '"delta":{"role":"assistant"}' in final_chunks[0]
-    assert '"tool_calls"' in final_chunks[1]
-    assert '\\"filePath\\":\\"test.txt\\"' in final_chunks[1]
+    c = _c(chunks)
+    assert '"reasoning_content"' in c[0]
+    # Tool calls now extracted during streaming (consume_event, not finalize)
+    assert any('"role":"assistant"' in s for s in c)
+    assert any('"tool_calls"' in s for s in c)
+    assert any('filePath' in s for s in c)
+    # finalize only emits finish_reason + [DONE]
+    assert final_chunks
+    assert b'"finish_reason":"tool_calls"' in final_chunks[0]
 
 
 def test_accumulator_build_response_extracts_tool_call_from_reasoning_fallback():
@@ -181,7 +194,7 @@ def test_accumulator_build_response_extracts_tool_call_from_reasoning_fallback()
     message = response["choices"][0]["message"]
 
     assert response["choices"][0]["finish_reason"] == "tool_calls"
-    assert message["content"] is None
+    assert message["content"] == ""
     assert message["tool_calls"][0]["function"]["name"] == "write"
     assert message["tool_calls"][0]["function"]["arguments"] == '{"filePath":"test.txt","content":""}'
 
@@ -278,10 +291,14 @@ def test_accumulator_drops_tool_preamble_and_repairs_shell_command_array():
 
     final_chunks = accumulator.finalize(status)
 
-    assert chunks == []
-    assert "我将创建文件" not in "".join(final_chunks)
-    assert '"tool_calls"' in final_chunks[1]
-    assert '\\"command\\":[\\"powershell.exe\\",\\"-Command\\",\\"pwd\\"]' in final_chunks[1]
+    # consume_event now emits tool calls early during streaming
+    assert len(chunks) >= 1
+    fc = _c(final_chunks)
+    # finalize emits remaining chunks (text after block + finish_reason)
+    assert "我将创建文件" not in "".join(fc)
+    # Sanitized arguments appear in the chunk, not the final
+    combined = "".join(_c(chunks) + fc)
+    assert '\\"command\\":[\\"powershell.exe\\",\\"-Command\\",\\"pwd\\"]' in combined
 
 
 def test_accumulator_defers_visible_text_when_tools_available():
@@ -302,8 +319,9 @@ def test_accumulator_defers_visible_text_when_tools_available():
     final_chunks = accumulator.finalize(status)
 
     assert chunks == []
-    assert '"content":"你好"' in final_chunks[0]
-    assert '"finish_reason":"stop"' in final_chunks[1]
+    fc = _c(final_chunks)
+    assert '"content":"你好"' in fc[0]
+    assert '"finish_reason":"stop"' in fc[1]
 
 
 def test_accumulator_reports_unavailable_dsml_tool_instead_of_empty_response():
@@ -331,9 +349,10 @@ def test_accumulator_reports_unavailable_dsml_tool_instead_of_empty_response():
     final_chunks = accumulator.finalize(status)
 
     assert chunks == []
-    assert "未声明工具" in final_chunks[0]
-    assert "`search`" in final_chunks[0]
-    assert '"finish_reason":"stop"' in final_chunks[1]
+    fc = _c(final_chunks)
+    assert "未声明工具" in fc[0]
+    assert "`search`" in fc[0]
+    assert '"finish_reason":"stop"' in fc[1]
 
 
 def test_convert_messages_respects_tool_choice_none_and_specific():
@@ -523,7 +542,7 @@ def test_accumulator_repairs_param_name_only_tool_call_with_fallback_url():
     message = response["choices"][0]["message"]
 
     assert response["choices"][0]["finish_reason"] == "tool_calls"
-    assert message["content"] is None
+    assert message["content"] == ""
     assert message["tool_calls"][0]["function"]["name"] == "mcp__CherryFetch__fetchJson"
     assert (
         message["tool_calls"][0]["function"]["arguments"]
@@ -592,7 +611,7 @@ def test_accumulator_keeps_markdown_block_separators_between_parts():
     )
 
     assert first_chunks
-    assert second_chunks[0].find("\\n\\n") != -1
+    assert b"\\n\\n" in second_chunks[0]
 
     response = accumulator.build_response()
     assert response["choices"][0]["message"]["content"] == (

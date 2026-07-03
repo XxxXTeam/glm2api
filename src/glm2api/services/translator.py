@@ -16,6 +16,11 @@ from ..config import AppConfig
 from ..logging_utils import debug_dump
 from ..model_variants import model_requests_search, model_requests_thinking, split_model_features
 from ..utils.tool_parser import StreamingToolParser, parse_tool_calls_from_text
+
+# Ponytail: pre-compiled patterns — faster, avoids re.compile cache lookups
+_THINK_OPEN_RE = re.compile(r'<think>')
+_THINK_CLOSE_RE = re.compile(r'</think>')
+_THINK_BLOCK_RE = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 from ..utils.tool_protocol import (
     BLOCKED_NATIVE_TOOL_NAMES,
     CANONICAL_TOOL_CALL_EXAMPLE,
@@ -31,12 +36,18 @@ from ..utils.tool_protocol import (
 
 
 ASSISTANT_ID_PATTERN = re.compile(r"^[a-z0-9]{24,}$")
+
+# CherryStudio MCP fetch tool names — passthrough with URL auto-fill from context.
+CHERRY_FETCH_TOOL_NAMES = {
+    "mcp__CherryFetch__fetchHtml",
+    "mcp__CherryFetch__fetchMarkdown",
+    "mcp__CherryFetch__fetchTxt",
+    "mcp__CherryFetch__fetchJson",
+}
 URL_PATTERN = re.compile(r"https?://[^\s<>()\"']+")
 POWERSHELL_CMDLET_PATTERN = re.compile(r"^[A-Z][A-Za-z]+-[A-Z][A-Za-z]+$")
 POWERSHELL_ALIASES = {"cat", "cd", "copy", "del", "dir", "echo", "erase", "ls", "md", "move", "pwd", "rd", "ren", "rm", "sc", "type"}
 
-# Ponytail: free DuckDuckGo search as fallback for guest mode search
-_SEARCH_TOOL_NAMES = {"retrieve", "search", "web_search"}
 _SEARCH_RESULT_COUNT = 8
 
 # Thread-safe search cache for parallel pre-fetch (ponytail: zero-wait DDG)
@@ -56,7 +67,12 @@ def _do_cache_search(query: str) -> None:
         result = _run_web_search(query)
         if result and not result.startswith("Search error") and not result.startswith("No search"):
             with _SEARCH_CACHE_LOCK:
-                _SEARCH_CACHE[query.lower().strip()] = (time.time(), result)
+                _SEARCH_CACHE[query.lower().strip()] = (time.monotonic(), result)
+                _MAX_SEARCH_CACHE = 200
+                if len(_SEARCH_CACHE) > _MAX_SEARCH_CACHE:
+                    oldest = sorted(_SEARCH_CACHE.items(), key=lambda kv: kv[1][1])[:50]
+                    for k, _ in oldest:
+                        del _SEARCH_CACHE[k]
     except Exception:
         pass
 
@@ -64,18 +80,9 @@ def _get_cached_search(query: str) -> str | None:
     """Get cached search results if they exist and are fresh."""
     with _SEARCH_CACHE_LOCK:
         entry = _SEARCH_CACHE.get(query.lower().strip())
-        if entry and (time.time() - entry[0]) < _SEARCH_CACHE_TTL:
+        if entry and (time.monotonic() - entry[0]) < _SEARCH_CACHE_TTL:
             return entry[1]
     return None
-
-def _evict_stale_cache() -> None:
-    """Remove expired cache entries."""
-    now = time.time()
-    with _SEARCH_CACHE_LOCK:
-        expired = [k for k, v in _SEARCH_CACHE.items() if (now - v[0]) >= _SEARCH_CACHE_TTL]
-        for k in expired:
-            del _SEARCH_CACHE[k]
-
 
 def _wait_for_search_result(query: str, timeout: float = 5.0) -> str | None:
     """Get cached search results, waiting up to `timeout` seconds if still being fetched."""
@@ -85,8 +92,8 @@ def _wait_for_search_result(query: str, timeout: float = 5.0) -> str | None:
         return cached
     
     # If not cached yet, a background fetch may be in progress - wait a bit
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         time.sleep(0.1)
         cached = _get_cached_search(query)
         if cached:
@@ -111,33 +118,7 @@ def _ddg_unwrap_url(href: str) -> str:
 
 
 def _parse_ddg_lite(html: str) -> list[tuple[str, str, str]]:
-    """Parse DuckDuckGo Lite HTML into (title, url, snippet) tuples.
-
-    Uses BeautifulSoup with the lxml backend (tolerant of malformed markup).
-    Results anchors carry class ``result-link``; snippets live in
-    ``td.result-snippet``. Both lists are in document order and line up 1:1.
-    """
-    try:
-        from bs4 import BeautifulSoup
-    except ImportError:
-        return _parse_ddg_lite_fallback(html)
-
-    soup = BeautifulSoup(html, "lxml")
-    links = soup.select("a.result-link") or soup.select("a.result-a")
-    snippets = [td.get_text(" ", strip=True) for td in soup.select("td.result-snippet")]
-    results: list[tuple[str, str, str]] = []
-    for idx, link in enumerate(links):
-        title = link.get_text(" ", strip=True)
-        if not title:
-            continue
-        url = _ddg_unwrap_url(link.get("href", ""))
-        snippet = snippets[idx] if idx < len(snippets) else ""
-        results.append((title, url, snippet))
-    return results
-
-
-def _parse_ddg_lite_fallback(html: str) -> list[tuple[str, str, str]]:
-    """Minimal stdlib fallback if BeautifulSoup/lxml are unavailable."""
+    """Parse DuckDuckGo Lite HTML using stdlib HTMLParser. No external deps."""
     parser = _DDGLiteParser()
     parser.feed(html)
     parser.close()
@@ -194,80 +175,77 @@ class _DDGLiteParser(HTMLParser):
 
 
 def _run_web_search(query: str) -> str:
-    """Search via DuckDuckGo Lite using curl_cffi (Chrome TLS/JA3 fingerprint).
-
-    No API key required. The ``impersonate="chrome"`` flag reproduces Chrome's
-    TLS handshake + HTTP/2 fingerprint, which bypasses DDG bot detection that
-    plain requests/httpx cannot pass.
-    """
+    """Search via DuckDuckGo Lite using stdlib. No external dependencies."""
+    import urllib.request
     try:
-        from curl_cffi import requests as cffi_requests
-    except ImportError as exc:
-        return f"Search unavailable: curl_cffi not installed ({exc})."
-
-    try:
-        resp = cffi_requests.get(
-            "https://lite.duckduckgo.com/lite/",
-            params={"q": query, "kl": "us-en"},
-            impersonate="chrome",
-            timeout=15,
+        data = urllib.parse.urlencode({"q": query, "kl": "us-en"}).encode()
+        req = urllib.request.Request(
+            "https://lite.duckduckgo.com/lite",
+            data=data,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
         )
-        if resp.status_code != 200:
-            return f"Search error: HTTP {resp.status_code}"
-        results = _parse_ddg_lite(resp.text)
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            if resp.status == 200:
+                results = _parse_ddg_lite(resp.read().decode())
+                if results:
+                    lines = [f'Web search results for "{query}":']
+                    for i, (title, link, snippet) in enumerate(results[:_SEARCH_RESULT_COUNT], 1):
+                        lines.append(f"{i}. {title}\n   URL: {link}\n   {snippet}")
+                    return "\n".join(lines)
     except Exception as exc:
         return f"Search error: {exc}"
 
-    if not results:
-        return f"No search results found for: {query}"
+    return f"No search results found for: {query}"
 
-    lines = [f'Web search results for "{query}":']
-    for i, (title, link, snippet) in enumerate(results[:_SEARCH_RESULT_COUNT], 1):
-        lines.append(f"{i}. {title}\n   URL: {link}\n   {snippet}")
-    return "\n".join(lines)
 
 
 def _execute_retrieve_tool_calls(tool_calls: list[dict[str, object]]) -> tuple[str, list[dict[str, object]]]:
-    """Intercept retrieve/search tool calls, execute via DuckDuckGo, return content + remaining tool calls."""
+    """Intercept retrieve/search tool calls, execute via DuckDuckGo concurrently, return content + remaining."""
     if not tool_calls:
         return "", tool_calls
 
-    search_results: list[str] = []
+    search_tasks: list[tuple[str, str]] = []  # (query, tool_call_id)
     remaining: list[dict[str, object]] = []
 
     for tc in tool_calls:
         fn = tc.get("function", {})
         tool_name = str(fn.get("name", "")).strip().lower()
-        if tool_name not in _SEARCH_TOOL_NAMES:
+        tool_id = str(tc.get("id", ""))
+        if tool_name not in {"retrieve", "search", "web_search"}:
             remaining.append(tc)
             continue
-
         arguments = fn.get("arguments", "{}")
         try:
             args = json.loads(arguments) if isinstance(arguments, str) else arguments
         except json.JSONDecodeError:
             remaining.append(tc)
             continue
-
-        # Extract queries from various argument formats
-        queries: list[str] = []
         if isinstance(args, dict):
             for val in args.values():
                 if isinstance(val, str):
-                    queries.append(val)
+                    search_tasks.append((val.strip(), tool_id))
                 elif isinstance(val, list):
                     for item in val:
                         if isinstance(item, dict):
                             for v in item.values():
                                 if isinstance(v, str):
-                                    queries.append(v)
+                                    search_tasks.append((v.strip(), tool_id))
                         elif isinstance(item, str):
-                            queries.append(item)
+                            search_tasks.append((item.strip(), tool_id))
 
-        for q in queries:
-            if q.strip():
-                result = _run_web_search(q.strip())
-                search_results.append(f"Search query: {q}\n\nResults:\n{result}")
+    # ponytail: run searches concurrently — 50 searches × 3s sequential = 150s, concurrent = 3s
+    import concurrent.futures as _cf
+    search_results: list[str] = []
+    if search_tasks:
+        with _cf.ThreadPoolExecutor(max_workers=10) as pool:
+            fut_map = {pool.submit(_run_web_search, q): q for q, _ in search_tasks}
+            for f in _cf.as_completed(fut_map):
+                q = fut_map[f]
+                try:
+                    result = f.result()
+                    search_results.append(f"Search query: {q}\n\nResults:\n{result}")
+                except Exception as exc:
+                    search_results.append(f"Search query: {q}\n\nResults:\nSearch error: {exc}")
 
     if search_results:
         content = "\n\n---\n\n".join(search_results)
@@ -373,6 +351,16 @@ def sanitize_tool_call_payload(
             if is_powershell_command and not is_shell_host:
                 cleaned["command"] = ["powershell.exe", "-Command", " ".join(command_parts)]
 
+
+    # CherryStudio MCP fetch: auto-fill URL from recent user message if missing
+    if tool_name in CHERRY_FETCH_TOOL_NAMES:
+        url_value = cleaned.get("url")
+        if not isinstance(url_value, str) or not url_value.strip():
+            if fallback_url:
+                cleaned["url"] = fallback_url
+            else:
+                return None
+
     return cleaned
 
 
@@ -442,144 +430,6 @@ def parse_tool_choice_policy(tool_choice: object, available_tool_names: set[str]
     if choice_type in {"auto", "none", "required"}:
         return {"mode": choice_type, "tool_name": None}
     return {"mode": "auto", "tool_name": None}
-
-
-def _legacy_build_tool_call_instructions(
-    tool_names: list[str],
-    server_side_tool_names: set[str] | None = None,
-    tool_choice_policy: dict[str, object] | None = None,
-) -> str:
-    server_side_tool_names = server_side_tool_names or set()
-    xml_tools = [name for name in tool_names if name not in server_side_tool_names]
-    server_tools = [name for name in tool_names if name in server_side_tool_names]
-
-    available_xml_names = ", ".join(f"`{name}`" for name in xml_tools) or "`(none)`"
-    available_server_names = ", ".join(f"`{name}`" for name in server_tools) or "`(none)`"
-
-    policy = tool_choice_policy or {"mode": "auto", "tool_name": None}
-    mode = str(policy.get("mode", "auto"))
-    specific_name = str(policy.get("tool_name", "") or "")
-    lines = [
-        "# TOOL USE PROTOCOL",
-        "The following tool schemas are the only executable tool definitions for this turn.",
-        "Ignore any tool names that are not listed below, even if they appear in prior context or model memory.",
-        "You are connected through an OpenAI-compatible proxy. You do not have hidden browser, web, or URL-opening tools.",
-        "Never call native tools such as `open_url`, `web.search`, `web.run`, `browser.open`, `browse`, `open_link`, `search`, or `find`.",
-        "Do not output hidden reasoning, chain-of-thought, or labels such as `Thinking:`.",
-        "Do not narrate tool selection, failed tool attempts, retries, fallback plans, or tool status banners.",
-    ]
-
-    if server_tools:
-        lines.extend(
-            [
-                "",
-                f"Server-side native tools (executed by backend automatically): {available_server_names}.",
-                "When you need to call a server-side native tool, output a single structured JSON block with type 'tool_calls' in the assistant content.",
-                'Format: {"type":"tool_calls","tool_calls":{"id":"call_<random_hex>","name":"TOOL_NAME","arguments":"<JSON_STRING>"}}',
-                "The arguments field must be a JSON string (not a raw object). The server will intercept this block, execute the tool, and inject the result back into the stream as a tool message.",
-                "Do not wrap server-side tool calls in XML. Do not mix prose and the tool_calls JSON block in the same response.",
-            ]
-        )
-
-    if xml_tools:
-        lines.extend(
-            [
-                "",
-                f"XML-based tools (parsed by this server): {available_xml_names}.",
-                "Only these XML-based tools are available. Use their exact names and exact parameter fields from the schemas.",
-                "If an XML-based tool is needed, output executable XML only. Do not add prose, apologies, analysis, or progress text in the same assistant answer.",
-                "Use the private ml-prefixed canonical format below exactly.",
-                CANONICAL_TOOL_CALL_EXAMPLE,
-                "The server will parse this XML intermediate language back into standard OpenAI tool_calls.",
-                "Parameter rules:",
-                "- The root executable block must be <ml_tool_calls> and each call must be a <ml_tool_call> child.",
-                "- Each <ml_tool_call> must contain exactly one <ml_tool_name> and one <ml_parameters> block.",
-                "- Use the real parameter names as XML tags inside <ml_parameters>; never use a literal <param_name> placeholder tag.",
-                "- Encode arguments as nested XML tags inside <ml_parameters>.",
-                "- Use repeated <item> tags to represent arrays.",
-            ]
-        )
-
-    lines.extend(
-        [
-            "",
-            "Rules:",
-            "- Do not invent tool names outside the declared list.",
-            "- If a URL, browsing, or search action is needed, use only an explicitly listed client tool. If none is listed, explain that no such tool is available. Never use bare tool names `search` or `find` unless they are explicitly listed above.",
-            "- If you decide to call a tool, call the selected tool directly; do not say you will try, switch, retry, or use a correct tool.",
-            "- Never output tool-call display text such as `⚙ tool_name [...]`; output only the executable XML block.",
-            "- After receiving a tool result, answer the user directly from the result and do not repeat the earlier tool-call decision process.",
-            "- For XML-based tools, do not emit OpenAI JSON tool_calls arrays, function_call objects, or any non-XML tool syntax.",
-            "- For XML-based tools, do not use <tool_calls>, <tool_call>, <tool_name>, <parameters>, <function_call>, <tool_use>, <invoke>, or any legacy wrapper.",
-            "- Do not place raw JSON directly inside <ml_parameters>.",
-            "- Do not mix normal explanation text with executable tool XML.",
-            "- Prefer <![CDATA[...]]> for arbitrary strings.",
-            "- Put multiple XML calls inside one <ml_tool_calls> root when you truly need multiple calls in one turn.",
-            "- After a <ml_tool_result ...> block, continue from that result and call another tool only when necessary.",
-        ]
-    )
-    if mode == "none":
-        lines.extend(
-            [
-                "Tool choice policy: none.",
-                "Do not emit any executable tool markup. Answer with normal text only.",
-            ]
-        )
-    elif mode == "required":
-        lines.extend(
-            [
-                "Tool choice policy: required.",
-                "You must call at least one tool before giving a final answer.",
-            ]
-        )
-    elif mode == "specific" and specific_name:
-        lines.extend(
-            [
-                "Tool choice policy: specific function.",
-                f"You must call exactly `{specific_name}` before giving a final answer.",
-                f"Do not call any tool other than `{specific_name}`.",
-            ]
-        )
-    return "\n".join(lines)
-
-
-def _legacy_tools_to_prompt(
-    tools: list[dict[str, object]],
-    blocked_tool_names: set[str] | None = None,
-    tool_choice_policy: dict[str, object] | None = None,
-    server_side_tool_names: set[str] | None = None,
-) -> str:
-    tool_names: list[str] = []
-    tool_schemas: list[str] = []
-    for tool in tools:
-        fn = tool.get("function", {})
-        name = str(fn.get("name", "unknown")) # type: ignore
-        description = str(fn.get("description", "") or "") # type: ignore
-        parameters = fn.get("parameters", {}) # type: ignore
-        tool_names.append(name)
-        tool_schemas.append(
-            "\n".join(
-                [
-                    f"Tool: {name}",
-                    f"Description: {description}",
-                    f"Parameters: {safe_json_dumps(parameters) if isinstance(parameters, dict) else '{}'}",
-                ]
-            )
-        )
-
-    parts = [
-        "# TOOL SCHEMAS",
-        "Treat the following schema list as the authoritative tool contract for this request.",
-        "",
-        "\n\n".join(tool_schemas),
-        "",
-        build_tool_call_instructions(
-            tool_names,
-            server_side_tool_names=server_side_tool_names,
-            tool_choice_policy=tool_choice_policy,
-        ),
-    ]
-    return "\n".join(part for part in parts if part is not None).strip()
 
 
 build_tool_call_instructions = _protocol_build_tool_call_instructions
@@ -714,6 +564,7 @@ def resolve_networking(model: str, web_search: object) -> bool:
 
 @dataclass
 class GLMEventAccumulator:
+
     model: str
     allowed_tool_names: set[str] | None = None
     fallback_tool_url: str | None = None
@@ -738,12 +589,17 @@ class GLMEventAccumulator:
     _cached_part_reasonings: dict[str, str] = field(default_factory=dict)
     _server_side_tool_calls: list[dict[str, object]] = field(default_factory=list)
     _server_side_tool_call_ids: set[str] = field(default_factory=set)
-    _deferred_visible_text: str = ""
+    _deferred_visible_text_parts: list[str] = field(default_factory=list)
+    _on_search_callback: object | None = None
+    _on_tool_callback: object | None = None
+    # Track tool calls emitted during streaming (so finalize doesn't re-emit)
+    _tool_calls_emitted_count: int = 0
+    _emitted_tool_call_ids: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.tool_parser.allowed_tool_names = self.allowed_tool_names
 
-    def consume_event(self, payload: dict[str, object]) -> tuple[list[str], str | None]:
+    def consume_event(self, payload: dict[str, object]) -> tuple[list[bytes], str | None]:
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM SSE 解析事件", payload)
         if not self.conversation_id and payload.get("conversation_id"):
             self.conversation_id = str(payload["conversation_id"])
@@ -784,7 +640,7 @@ class GLMEventAccumulator:
         self.last_full_text = self._cached_full_text
         self.last_full_reasoning = self._cached_full_reasoning
 
-        chunks: list[str] = []
+        chunks: list[bytes] = []
         if reasoning_delta:
             chunks.append(
                 self._chunk_json(
@@ -800,10 +656,49 @@ class GLMEventAccumulator:
                 )
             )
 
+        # Ponytail: check reasoning content for tool calls during streaming.
+        # The think-search model sometimes emits DSML XML inside reasoning instead of text.
+        # Extract early so the client sees tool calls in real-time, not just at finalize.
+        _, reasoning_tool_calls = parse_tool_calls_from_text(
+            self._cached_full_reasoning.strip(),
+            allowed_tool_names=self.allowed_tool_names,
+        )
+        if reasoning_tool_calls:
+            # Deduplicate against already-emitted tool calls
+            new_calls = [tc for tc in reasoning_tool_calls if tc.get("id", "") not in self._emitted_tool_call_ids]
+            if new_calls:
+                if not self.emitted_role:
+                    chunks.append(
+                        self._chunk_json({
+                            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
+                        })
+                    )
+                    self.emitted_role = True
+                for tc in new_calls:
+                    tc["index"] = len(self.tool_parser.tool_calls)
+                    self.tool_parser.tool_calls.append(tc)
+                    self._emitted_tool_call_ids.add(tc["id"])
+                    chunks.append(
+                        self._chunk_json({
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [{
+                                        "index": tc["index"],
+                                        "id": tc["id"],
+                                        "type": "function",
+                                        "function": tc["function"],
+                                    }]
+                                },
+                                "finish_reason": None,
+                            }]
+                        })
+                    )
+
         visible_text_delta = self.tool_parser.consume(text_delta)
         if visible_text_delta:
             if self.allowed_tool_names is not None:
-                self._deferred_visible_text += visible_text_delta
+                self._deferred_visible_text_parts.append(visible_text_delta)
             else:
                 delta_payload: dict[str, object] = {"content": visible_text_delta}
                 if not self.emitted_role:
@@ -822,18 +717,65 @@ class GLMEventAccumulator:
                         }
                     )
                 )
+
+        # Emit newly detected tool calls from early invoke extraction
+        new_tool_calls = self.tool_parser.tool_calls[self._tool_calls_emitted_count:]
+        if new_tool_calls:
+            if not self.emitted_role:
+                chunks.append(
+                    self._chunk_json(
+                        {
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"role": "assistant"},
+                                    "finish_reason": None,
+                                }
+                            ]
+                        }
+                    )
+                )
+                self.emitted_role = True
+            for tc in new_tool_calls:
+                chunks.append(
+                    self._chunk_json(
+                        {
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": tc["index"],
+                                                "id": tc["id"],
+                                                "type": "function",
+                                                "function": tc["function"],
+                                            }
+                                        ]
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ]
+                        }
+                    )
+                )
+                self._emitted_tool_call_ids.add(tc["id"])
+            self._tool_calls_emitted_count = len(self.tool_parser.tool_calls)
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM SSE 生成增量块", chunks)
         return chunks, str(payload.get("status")) if payload.get("status") is not None else None
 
-    def finalize(self, status: str | None, last_error: dict[str, object] | None = None) -> list[str]:
+    def finalize(self, status: str | None, last_error: dict[str, object] | None = None) -> list[bytes]:
         tail_text, xml_tool_calls = self.tool_parser.flush()
         xml_tool_calls = sanitize_tool_calls(xml_tool_calls, fallback_url=self.fallback_tool_url)
         if not xml_tool_calls:
             xml_tool_calls = self._extract_reasoning_tool_calls()
 
-        # Merge server-side and XML tool calls, re-indexing
+        # Merge server-side and XML tool calls, re-indexing.
+        # Only include tool calls not already emitted during streaming.
         all_tool_calls: list[dict[str, object]] = list(self._server_side_tool_calls)
         for tc in xml_tool_calls:
+            if tc.get("id", "") in self._emitted_tool_call_ids:
+                continue  # Already emitted during streaming
             tc_copy = dict(tc)
             tc_copy["index"] = len(all_tool_calls)
             all_tool_calls.append(tc_copy)
@@ -841,9 +783,11 @@ class GLMEventAccumulator:
         # Ponytail: intercept retrieve/search tool calls with DuckDuckGo fallback
         search_content, remaining_tool_calls = _execute_retrieve_tool_calls(all_tool_calls)
         if search_content:
+            if self._on_search_callback:
+                self._on_search_callback()
             all_tool_calls = remaining_tool_calls
             if self.allowed_tool_names is not None:
-                self._deferred_visible_text += "\n\n" + search_content
+                self._deferred_visible_text_parts.append("\n\n" + search_content)
             else:
                 if tail_text:
                     tail_text += "\n\n" + search_content
@@ -862,48 +806,49 @@ class GLMEventAccumulator:
                 len(self._server_side_tool_calls),
             )
 
-        chunks: list[str] = []
-        final_text = self._deferred_visible_text + tail_text
-        self._deferred_visible_text = ""
-        if not final_text and not all_tool_calls and self.allowed_tool_names is not None:
-            _, attempted_tool_calls = parse_tool_calls_from_text(
-                self._cached_full_text.strip(),
-                allowed_tool_names=None,
-            )
-            unavailable_names = sorted(
-                {
-                    str(tool_call.get("function", {}).get("name", "")).strip()
-                    for tool_call in attempted_tool_calls
-                    if isinstance(tool_call.get("function"), dict)
-                    and str(tool_call.get("function", {}).get("name", "")).strip()
-                    not in self.allowed_tool_names
-                }
-            )
-            if unavailable_names:
-                allowed_names = ", ".join(sorted(self.allowed_tool_names)) or "(none)"
-                final_text = (
-                    "模型尝试调用未声明工具 "
-                    + ", ".join(f"`{name}`" for name in unavailable_names)
-                    + f"，已阻止。本轮只允许这些工具：{allowed_names}。"
+        chunks: list[bytes] = []
+        had_tool_calls = bool(all_tool_calls) or bool(self._emitted_tool_call_ids)
+        final_text = "".join(self._deferred_visible_text_parts) + tail_text
+        self._deferred_visible_text_parts: list[str] = []
+        if not final_text and not had_tool_calls and self.allowed_tool_names is not None:
+                _, attempted_tool_calls = parse_tool_calls_from_text(
+                    self._cached_full_text.strip(),
+                    allowed_tool_names=None,
                 )
-        if final_text and not all_tool_calls:
-            delta_payload: dict[str, object] = {"content": final_text}
-            if not self.emitted_role:
-                delta_payload = {"role": "assistant", "content": final_text}
-                self.emitted_role = True
-            chunks.append(
-                self._chunk_json(
+                unavailable_names = sorted(
                     {
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": delta_payload,
-                                "finish_reason": None,
-                            }
-                        ]
+                        str(tool_call.get("function", {}).get("name", "")).strip()
+                        for tool_call in attempted_tool_calls
+                        if isinstance(tool_call.get("function"), dict)
+                        and str(tool_call.get("function", {}).get("name", "")).strip()
+                        not in self.allowed_tool_names
                     }
                 )
-            )
+                if unavailable_names:
+                    allowed_names = ", ".join(sorted(self.allowed_tool_names)) or "(none)"
+                    final_text = (
+                        "模型尝试调用未声明工具 "
+                        + ", ".join(f"`{name}`" for name in unavailable_names)
+                        + f"，已阻止。本轮只允许这些工具：{allowed_names}。"
+                    )
+        if final_text and not had_tool_calls:
+                delta_payload: dict[str, object] = {"content": final_text}
+                if not self.emitted_role:
+                    delta_payload = {"role": "assistant", "content": final_text}
+                    self.emitted_role = True
+                chunks.append(
+                    self._chunk_json(
+                        {
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": delta_payload,
+                                    "finish_reason": None,
+                                }
+                            ]
+                        }
+                    )
+                )
 
         if status == "intervene" and last_error and last_error.get("intervene_text"):
             chunks.append(
@@ -920,47 +865,47 @@ class GLMEventAccumulator:
                 )
             )
 
-        if all_tool_calls:
-            if not self.emitted_role:
-                chunks.append(
-                    self._chunk_json(
-                        {
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"role": "assistant"},
-                                    "finish_reason": None,
-                                }
-                            ]
-                        }
+        if had_tool_calls:
+                if not self.emitted_role:
+                    chunks.append(
+                        self._chunk_json(
+                            {
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"role": "assistant"},
+                                        "finish_reason": None,
+                                    }
+                                ]
+                            }
+                        )
                     )
-                )
-                self.emitted_role = True
-            for tool_call in all_tool_calls:
-                chunks.append(
-                    self._chunk_json(
-                        {
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [
-                                            {
-                                                "index": tool_call["index"],
-                                                "id": tool_call["id"],
-                                                "type": "function",
-                                                "function": tool_call["function"],
-                                            }
-                                        ]
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ]
-                        }
+                    self.emitted_role = True
+                for tool_call in all_tool_calls:
+                    chunks.append(
+                        self._chunk_json(
+                            {
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "tool_calls": [
+                                                {
+                                                    "index": tool_call["index"],
+                                                    "id": tool_call["id"],
+                                                    "type": "function",
+                                                    "function": tool_call["function"],
+                                                }
+                                            ]
+                                        },
+                                        "finish_reason": None,
+                                    }
+                                ]
+                            }
+                        )
                     )
-                )
 
-        finish_reason = "tool_calls" if all_tool_calls else "stop"
+        finish_reason = "tool_calls" if had_tool_calls else "stop"
         chunks.append(
             self._chunk_json(
                 {
@@ -975,7 +920,7 @@ class GLMEventAccumulator:
                 }
             )
         )
-        chunks.append("data: [DONE]\n\n")
+        chunks.append(b"data: [DONE]\n\n")
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM SSE finalize 输出", chunks)
         return chunks
 
@@ -1004,15 +949,23 @@ class GLMEventAccumulator:
         # Run BEFORE computing final_content so search results flow into `content`.
         search_content, remaining_tool_calls = _execute_retrieve_tool_calls(all_tool_calls)
         if search_content:
+            if self._on_search_callback:
+                self._on_search_callback()
             all_tool_calls = remaining_tool_calls
             clean_content = (clean_content + "\n\n" + search_content) if clean_content else search_content
             if self.logger:
                 self.logger.info("非流式：已拦截检索工具调用，通过 DuckDuckGo 执行搜索 text_len=%s", len(search_content))
 
         final_content = clean_content.strip()
+        # Ponytail: upstream may return finish=stop with zero text parts
+        # (e.g. upstream timeout mid-generation, or model refuses the prompt).
+        # Return empty string instead of None so clients don't crash.
+        if not final_content and not all_tool_calls:
+            if self.logger:
+                self.logger.warning("上游返回空内容（finish=stop 但无文本），返回空白响应 model=%s", self.model)
         message: dict[str, object] = {
             "role": "assistant",
-            "content": None if all_tool_calls or not final_content else final_content,
+            "content": "" if all_tool_calls or not final_content else final_content,
             "reasoning_content": full_reasoning or None,
         }
         if all_tool_calls:
@@ -1141,7 +1094,12 @@ class GLMEventAccumulator:
         self._render_cache_dirty = False
         return self._cached_full_text, self._cached_full_reasoning
 
-    def _chunk_json(self, patch: dict[str, object]) -> str:
+    # Pre-built SSE frame prefix/suffix as bytes (Ponytail: avoid repeat encode())
+    _SSE_PREFIX = b"data: "
+    _SSE_SUFFIX = b"\n\n"
+
+    def _chunk_json(self, patch: dict[str, object]) -> bytes:
+        """Build SSE frame as bytes — avoids str.encode() per chunk in hot path."""
         payload = {
             "id": self.conversation_id,
             "object": "chat.completion.chunk",
@@ -1149,4 +1107,5 @@ class GLMEventAccumulator:
             "model": self.model,
         }
         payload.update(patch)
-        return "data: " + safe_json_dumps(payload) + "\n\n"
+        return self._SSE_PREFIX + safe_json_dumps(payload).encode("utf-8") + self._SSE_SUFFIX
+

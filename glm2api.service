@@ -1,0 +1,29 @@
+[Unit]
+Description=glm2api — GLM-5.2 API proxy for ZCode/t3
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=uluru
+Group=uluru
+WorkingDirectory=/home/uluru/ZCodeProject/glm2api
+
+# Use venv Python if it exists, fallback to system Python
+ExecStart=/home/uluru/ZCodeProject/glm2api/.venv/bin/python -m glm2api
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=1024
+
+[Install]
+WantedBy=multi-user.target

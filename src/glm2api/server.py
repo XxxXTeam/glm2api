@@ -18,6 +18,7 @@ from .services.anthropic_adapter import (
     openai_to_anthropic_response,
 )
 from .services.glm_client import GLMWebClient, QueueTimeoutError, UpstreamAPIError
+from .services.request_queue import get_request_queue
 from .services.responses_adapter import (
     ResponsesStreamAccumulator,
     openai_to_responses,
@@ -190,20 +191,20 @@ class GLM2APIServer:
                     self._write_json(HTTPStatus.OK, result)
                 except QueueTimeoutError as exc:
                     logger.warning("GLM 队列等待超时 error=%s", exc)
-                    self._write_json(
+                    self._safe_write_json(
                         HTTPStatus.SERVICE_UNAVAILABLE,
                         {"error": {"message": str(exc), "type": "queue_timeout"}},
                     )
                 except UpstreamAPIError as exc:
                     logger.warning("上游 GLM 返回错误 status=%s error=%s", exc.status_code, exc)
                     status = self._safe_http_status(exc.status_code, fallback=HTTPStatus.BAD_GATEWAY)
-                    self._write_json(
+                    self._safe_write_json(
                         status,
                         {"error": {"message": str(exc), "type": "upstream_error", "details": exc.payload}},
                     )
                 except ValueError as exc:
                     logger.warning("请求参数错误 path=%s error=%s", self.path, exc)
-                    self._write_json(
+                    self._safe_write_json(
                         HTTPStatus.BAD_REQUEST,
                         {"error": {"message": str(exc), "type": "invalid_request"}},
                     )
@@ -234,17 +235,7 @@ class GLM2APIServer:
                 openai_payload["stream"] = True
                 accumulator = AnthropicStreamAccumulator(model=model)
 
-                self.send_response(HTTPStatus.OK)
-                self._send_common_headers()
-                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("X-Accel-Buffering", "no")
-                self.end_headers()
-
-                try:
-                    self.wfile.flush()
-                except _CLIENT_DISCONNECTED:
-                    return
+                self._begin_sse_stream()
 
                 stream_iter = glm_client.stream_chat_completion(openai_payload)
                 try:
@@ -294,17 +285,7 @@ class GLM2APIServer:
                 openai_payload["stream"] = True
                 accumulator = ResponsesStreamAccumulator(model=model)
 
-                self.send_response(HTTPStatus.OK)
-                self._send_common_headers()
-                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("X-Accel-Buffering", "no")
-                self.end_headers()
-
-                try:
-                    self.wfile.flush()
-                except _CLIENT_DISCONNECTED:
-                    return
+                self._begin_sse_stream()
 
                 stream_iter = glm_client.stream_chat_completion(openai_payload)
                 chunk_queue: queue.Queue[object] = queue.Queue()
@@ -368,18 +349,7 @@ class GLM2APIServer:
             def _stream_completion(self, payload: dict[str, object]) -> None:
                 model = str(payload.get("model", "unknown"))
                 logger.info("开始流式响应 model=%s", model)
-                self.send_response(HTTPStatus.OK)
-                self._send_common_headers()
-                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("X-Accel-Buffering", "no")
-                self.end_headers()
-
-                # Send keepalive comment immediately to prevent GUI timeout
-                try:
-                    self.wfile.flush()
-                except _CLIENT_DISCONNECTED:
-                    return
+                self._begin_sse_stream()
 
                 stream_iter = glm_client.stream_chat_completion(payload)
                 sent_done = False
@@ -444,6 +414,19 @@ class GLM2APIServer:
                     "Authorization, Content-Type, x-api-key, anthropic-version",
                 )
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+            def _begin_sse_stream(self) -> None:
+                """Send SSE response headers and flush. Shared by all 3 streaming endpoints."""
+                self.send_response(HTTPStatus.OK)
+                self._send_common_headers()
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                try:
+                    self.wfile.flush()
+                except _CLIENT_DISCONNECTED:
+                    return
 
             def _safe_write_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
                 try:
