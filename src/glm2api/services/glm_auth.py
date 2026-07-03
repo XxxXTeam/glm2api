@@ -208,15 +208,62 @@ class GLMAccessTokenManager:
                 pool.report_failure(proxy_url)
             raise urllib.error.URLError(str(exc)) from exc
 
+    @staticmethod
+    def _is_jwt_guest_token(token: str) -> bool:
+        """Check if a JWT token is a guest token by inspecting the payload."""
+        if token == GUEST_REFRESH_TOKEN_MARKER:
+            return True
+        try:
+            import base64 as _b64, json as _json
+            parts = token.strip().split(".")
+            if len(parts) == 3:
+                payload = parts[1]
+                # Add padding for base64 decode
+                payload += "=" * (4 - len(payload) % 4)
+                decoded = _b64.urlsafe_b64decode(payload)
+                data = _json.loads(decoded)
+                return data.get("is_guest") is True
+        except Exception:
+            pass
+        return False
+
     def _init_guest_pool(self, raw_tokens: list[str]) -> None:
-        """Initialize account pool. In guest mode uses lazy init to preserve quota."""
-        is_guest = all(t == GUEST_REFRESH_TOKEN_MARKER for t in raw_tokens) if raw_tokens else True
+        """Initialize account pool.
+        Detects guest mode via:
+          1. All tokens are GUEST_REFRESH_TOKEN_MARKER (explicit guest mode)
+          2. All tokens are guest JWT tokens (is_guest: true in payload)
+        When pre-created guest tokens are provided, preserves them in AccountState
+        so each slot starts with a unique guest session (from a different proxy IP)."""
+        # Detect guest mode
+        if raw_tokens:
+            is_guest = all(t == GUEST_REFRESH_TOKEN_MARKER or self._is_jwt_guest_token(t) for t in raw_tokens)
+        else:
+            is_guest = True
+
         if is_guest:
             pool_size = max(3, self.config.glm_max_concurrency)
-            self._accounts = [AccountState(refresh_token="", is_guest=True) for _ in range(pool_size)]
-            self.logger.info(
-                "游客槽位初始化 数量=%s (延迟获取, 不预耗配额)", pool_size
-            )
+            if raw_tokens and not all(t == GUEST_REFRESH_TOKEN_MARKER for t in raw_tokens):
+                # Pre-created guest tokens — spin up background pre-warm so server
+                # starts immediately while tokens warm up in the background
+                self._accounts = []
+                for i in range(pool_size):
+                    if i < len(raw_tokens) and raw_tokens[i] != GUEST_REFRESH_TOKEN_MARKER:
+                        self._accounts.append(AccountState(refresh_token=raw_tokens[i], is_guest=True))
+                    else:
+                        self._accounts.append(AccountState(refresh_token="", is_guest=True))
+                pre_created = sum(1 for a in self._accounts if a.refresh_token)
+                self.logger.info(
+                    "游客槽位初始化 数量=%s (其中 %s 个预创建 token) — 后台预刷新开始",
+                    pool_size, pre_created
+                )
+                # Background pre-warm: staggered 3s intervals to avoid per-IP rate limits
+                threading.Thread(target=self._background_prewarm, daemon=True).start()
+            else:
+                # No pre-created tokens — create empty guest slots (lazy fetch)
+                self._accounts = [AccountState(refresh_token="", is_guest=True) for _ in range(pool_size)]
+                self.logger.info(
+                    "游客槽位初始化 数量=%s (延迟获取, 不预耗配额)", pool_size
+                )
         else:
             self._accounts = [
                 AccountState(refresh_token=t, is_guest=False) for t in raw_tokens
@@ -224,7 +271,29 @@ class GLMAccessTokenManager:
             self.logger.info(
                 "账号池初始化 数量=%s", len(self._accounts)
             )
-    
+
+    def _background_prewarm(self) -> None:
+        """Background thread: pre-warms guest access tokens from pre-created refresh_tokens.
+        Uses staggered 3s intervals to avoid triggering the Tengine CDN per-IP rate limit."""
+        import time as _t
+        for idx, acct in enumerate(self._accounts):
+            if not acct.is_guest:
+                continue
+            if acct.cached_token is not None:
+                continue  # already warm
+            try:
+                acct.cached_token = self._fetch_guest_access_token(idx, rate_limit=True)
+                if acct.cached_token:
+                    self.logger.info("后台预刷新 access_token 成功 index=%s", idx)
+                else:
+                    self.logger.warning("后台预刷新 access_token 失败 index=%s", idx)
+            except Exception as exc:
+                self.logger.warning("后台预刷新 access_token 失败 index=%s error=%s", idx, exc)
+            # Rate-limit friendly sleep between attempts
+            _t.sleep(3)
+        active = sum(1 for a in self._accounts if a.cached_token is not None)
+        self.logger.info("后台预刷新完成 active=%s/%s", active, len(self._accounts))
+
     def spawn_fresh_guest_account(self) -> int:
         """Dynamically create a new guest account with fresh independent quota pool.
     

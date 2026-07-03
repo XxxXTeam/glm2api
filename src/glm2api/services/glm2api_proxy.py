@@ -140,17 +140,90 @@ class SmartProxyPool:
         return results
 
     @staticmethod
-    def _verify_socks5(proxy_url: str, target_host: str = "chatglm.cn", target_port: int = 443, timeout: float = 3) -> float | None:
-        """Test SOCKS5 proxy with full HTTP guest token request.
-        ponytail: does SOCKS5 handshake + TLS 1.2 + HTTP POST with proper JS-matched headers.
-        Returns latency in ms on success, None on failure. This ensures only proxies
-        that can actually route GLM API traffic are accepted."""
+    def _verify_socks5(proxy_url: str, target_host: str = "chatglm.cn", target_port: int = 443, timeout: float = 10) -> float | None:
+        """Test SOCKS5/HTTP proxy with curl_cffi Chrome 120 impersonation.
+
+        Uses curl_cffi (matching the real HTTP client) instead of raw socket+TLS 1.2.
+        This ensures proxies are verified with the same TLS fingerprint the actual
+        requests will use — a proxy that passes raw TLS 1.2 may still fail with
+        curl_cffi's Chrome 120 JA3 fingerprint (which is what the WAF sees).
+
+        Two-phase test:
+          1. GET chatglm.cn homepage — checks basic connectivity + WAF response
+          2. POST guest/access endpoint — verifies full token flow works
+
+        Returns latency in ms on success, None on failure.
+        """
+        try:
+            from curl_cffi import requests as _cffi_req
+        except ImportError:
+            # Fallback to raw socket verification if curl_cffi is unavailable
+            return SmartProxyPool._verify_socks5_raw(proxy_url, target_host, target_port, timeout)
+
+        start = time.monotonic()
+        proxies = {"https": proxy_url, "http": proxy_url}
+
+        try:
+            # Phase 1: Quick GET to chatglm.cn
+            resp = _cffi_req.get(
+                f"https://{target_host}/",
+                impersonate="chrome120",
+                proxies=proxies,
+                timeout=timeout,
+            )
+            if resp.status_code != 200:
+                return None
+
+            # Phase 2: Guest token POST (the real test)
+            import hashlib as _hl, uuid as _uid
+            ts = str(int(time.time() * 1000))
+            digits = [int(c) for c in ts]
+            checksum = (sum(digits) - digits[-2]) % 10
+            ts2 = ts[:-2] + str(checksum) + ts[-1]
+            nonce = _uid.uuid4().hex
+            sign = _hl.md5(f"{ts2}-{nonce}-8a1317a7468aa3ad86e997d08f3f31cb".encode()).hexdigest()
+
+            headers = {
+                "Content-Type": "application/json;charset=utf-8",
+                "Content-Length": "0",
+                "App-Name": "chatglm",
+                "Origin": f"https://{target_host}",
+                "Referer": f"https://{target_host}/",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
+                "X-App-Fr": "browser_extension",
+                "X-App-Platform": "pc",
+                "X-App-Version": "1.0.83",
+                "X-Device-Id": _uid.uuid4().hex,
+                "X-Lang": "en",
+                "X-Nonce": nonce,
+                "X-Request-Id": _uid.uuid4().hex,
+                "X-Sign": sign,
+                "X-Timestamp": ts2,
+            }
+            resp2 = _cffi_req.post(
+                f"https://{target_host}/chatglm/user-api/guest/access",
+                impersonate="chrome120",
+                proxies=proxies,
+                headers=headers,
+                timeout=timeout + 5,
+            )
+            if resp2.status_code == 200:
+                data = resp2.json()
+                if data.get("status") == 0 and data.get("result", {}).get("access_token"):
+                    return (time.monotonic() - start) * 1000
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _verify_socks5_raw(proxy_url: str, target_host: str = "chatglm.cn", target_port: int = 443, timeout: float = 3) -> float | None:
+        """Fallback raw socket SOCKS5 verifier (original method).
+        Used when curl_cffi is not installed."""
         import socket as _sck, hashlib, uuid, ssl as _ssl
         raw = proxy_url.replace("socks5://", "").replace("http://", "").replace("https://", "")
         host, port_str = raw.split(":") if ":" in raw else (raw, "1080")
         port = int(port_str)
         try:
-            # SOCKS5 handshake
             start = time.monotonic()
             s = _sck.create_connection((host, port), timeout=timeout)
             s.sendall(b"\x05\x01\x00")
@@ -160,14 +233,12 @@ class SmartProxyPool:
             resp = s.recv(10)
             if len(resp) < 2 or resp[1] != 0x00: s.close(); return None
 
-            # TLS 1.2 through tunnel (WAF blocks TLS 1.3)
             ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
             ctx.minimum_version = _ssl.TLSVersion.TLSv1_2
             ctx.maximum_version = _ssl.TLSVersion.TLSv1_2
             ctx.check_hostname = False; ctx.verify_mode = _ssl.CERT_NONE
             ss = ctx.wrap_socket(s, server_hostname=target_host)
 
-            # Guest token POST with exact JS-matched headers
             ts = str(int(time.time() * 1000))
             digits = [int(c) for c in ts]
             checksum = (sum(digits) - digits[-2]) % 10
@@ -220,13 +291,13 @@ class SmartProxyPool:
             return None
 
     def _verify_and_filter(self, urls: list[str], min_working: int = 200, max_to_check: int = 1500) -> list[str]:
-        """Verify proxies against chatglm.cn with full HTTP test, return only working ones.
+        """Verify proxies against chatglm.cn using curl_cffi Chrome 120 impersonation.
         ponytail: checks first max_to_check proxies concurrently, cancels remaining once target hit.
-        Uses full SOCKS5 + TLS 1.2 + HTTP guest token request for verification.
-        ~1500 × 5s / 50 workers = ~150s worst case, typically ~60s."""
+        Uses curl_cffi (not raw socket) for verification — matches how proxy is used in production.
+        ~1500 × 15s / 50 workers = ~450s worst case, typically ~120s."""
         import concurrent.futures as _cf
         check = urls[:max_to_check]
-        log.info("Verifying %d proxies against chatglm.cn (need %d)...", len(check), min_working)
+        log.info("Verifying %d proxies against chatglm.cn via curl_cffi (need %d)...", len(check), min_working)
         working: list[tuple[str, float]] = []
 
         with _cf.ThreadPoolExecutor(max_workers=50) as pool:
@@ -234,7 +305,7 @@ class SmartProxyPool:
             for f in _cf.as_completed(fut_map):
                 u = fut_map[f]
                 try:
-                    latency = f.result(timeout=8)  # HTTP test needs more time
+                    latency = f.result(timeout=25)  # curl_cffi two-phase test needs more time
                     if latency is not None:
                         working.append((u, latency))
                         if len(working) >= min_working:
@@ -246,7 +317,7 @@ class SmartProxyPool:
                     pass
 
         result = [u for u, _ in working]
-        log.info("Verification done: %d/%d proxies work against chatglm.cn", len(result), len(check))
+        log.info("Verification done: %d/%d proxies work via curl_cffi Chrome 120", len(result), len(check))
         return result
 
     def _auto_refresh(self) -> None:
@@ -353,6 +424,119 @@ class SmartProxyPool:
 
         with _cf.ThreadPoolExecutor(max_workers=50) as pool:
             list(pool.map(_check_one, proxies))
+
+        # -- Specific check for the aimiligate VPN proxy (http://127.0.0.1:7928) --
+        # The generic TCP-level check above can report the VPN proxy as alive because
+        # the local proxy server process is still listening on the port, even when the
+        # VPN tunnel (tun0) is broken and actual proxied requests return 502.
+        # Here we do an application-level probe through the proxy to detect that case.
+        self._check_vpn_proxy(now)
+
+    # ------------------------------------------------------------------ #
+    #  Aimiligate VPN proxy special handling
+    # ------------------------------------------------------------------ #
+    _VPN_PROXY_MARKER = "127.0.0.1:7928"
+
+    def _check_vpn_proxy(self, now: float) -> None:
+        """Application-level health check for the aimiligate VPN proxy.
+
+        If the proxy has been unreachable for >60s, trigger a VPN reconnect.
+        """
+        vpn_proxy: ProxyScore | None = None
+        with self._lock:
+            for p in self._proxies.values():
+                if self._VPN_PROXY_MARKER in p.url:
+                    vpn_proxy = p
+                    break
+
+        if vpn_proxy is None:
+            return  # VPN proxy not in this pool, nothing to do
+
+        # Do an actual HTTP request through the proxy to verify real connectivity
+        vpn_alive = self._probe_vpn_proxy(vpn_proxy.url)
+
+        if not vpn_alive:
+            # Mark it as failed in the pool
+            now_m = time.monotonic()
+            vpn_proxy.consec_failures += 1
+            vpn_proxy.last_fail = now_m
+            if vpn_proxy.consec_failures >= 2:
+                vpn_proxy.alive = False
+                vpn_proxy.blacklisted_until = now_m + min(
+                    self.COOLDOWN_BASE * (2 ** min(vpn_proxy.consec_failures, 5)),
+                    self.COOLDOWN_MAX,
+                )
+            vpn_proxy._score_cache = vpn_proxy._recompute_score()
+            log.warning(
+                "VPN proxy %s application-level check failed (%d consecutive)",
+                vpn_proxy.url, vpn_proxy.consec_failures,
+            )
+
+            # If it's been down for >60s, trigger a reconnect
+            if now_m - vpn_proxy.last_fail > 60:
+                log.warning("VPN proxy down for >60s, triggering VPN reconnect")
+                self._reconnect_vpn()
+        else:
+            # Restore to alive if it was down
+            if not vpn_proxy.alive:
+                log.info("VPN proxy %s is back online", vpn_proxy.url)
+                vpn_proxy.alive = True
+                vpn_proxy.consec_failures = 0
+                vpn_proxy.blacklisted_until = 0.0
+                vpn_proxy._score_cache = vpn_proxy._recompute_score()
+
+    @staticmethod
+    def _probe_vpn_proxy(proxy_url: str, target: str = "https://chatglm.cn/") -> bool:
+        """Make an actual HTTP request through the proxy to verify real connectivity.
+
+        This catches the case where the proxy port is listening but the VPN tunnel
+        is broken (returning 502/bad gateway).
+        """
+        try:
+            import urllib.request
+            proxy_handler = urllib.request.ProxyHandler({
+                "http": proxy_url,
+                "https": proxy_url,
+            })
+            opener = urllib.request.build_opener(proxy_handler)
+            resp = opener.open(target, timeout=10)
+            return resp.status == 200
+        except Exception:
+            return False
+
+    @staticmethod
+    def _reconnect_vpn() -> None:
+        """Try to restart the aimiligate VPN.
+
+        Kills the vpngate_manager process and starts a fresh instance.
+        The watchdog at scripts/vpn_watchdog.py will also catch this case,
+        but this provides faster in-process detection and recovery.
+        """
+        import subprocess as _sp
+        vpngate_path = "/home/uluru/aimili-vpngate/vpngate_manager.py"
+        try:
+            # Kill existing process
+            _sp.run(
+                ["pkill", "-9", "-f", "vpngate_manager.py"],
+                timeout=5, capture_output=True,
+            )
+            time.sleep(2)
+            # Also kill lingering OpenVPN processes on tun0
+            _sp.run(
+                ["pkill", "-9", "-f", "openvpn.*tun0"],
+                timeout=3, capture_output=True,
+            )
+            time.sleep(1)
+            # Start fresh
+            _sp.Popen(
+                ["python3", vpngate_path],
+                stdout=_sp.DEVNULL,
+                stderr=_sp.DEVNULL,
+                stdin=_sp.DEVNULL,
+            )
+            log.warning("VPN reconnect triggered — waiting for tunnel...")
+        except Exception as exc:
+            log.warning("VPN reconnect failed: %s", exc)
 
     def get_best(self) -> str | None:
         """Return a proxy URL using weighted random selection from top N candidates.
