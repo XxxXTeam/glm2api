@@ -127,8 +127,6 @@ class StreamingResponseWrapper:
         # Read exactly ONE line from iter_lines and return it (with \n restored)
         # _iter_sse_events will accumulate lines in its pending buffer
         try:
-            if _time.monotonic() > _deadline:
-                return b""
             line = next(self._line_iter)
             if self._read_deadline is None:
                 self._read_deadline = _time.monotonic() + 300

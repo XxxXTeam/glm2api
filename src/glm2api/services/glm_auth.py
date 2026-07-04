@@ -305,9 +305,12 @@ class GLMAccessTokenManager:
             )
 
     def _background_prewarm(self) -> None:
-        """Background thread: pre-warms guest access tokens.
-        Uses staggered 3s intervals to avoid triggering the Tengine CDN per-IP rate limit.
-        Retries failed accounts in a loop until all are warm."""
+        """Background thread: pre-warms guest access tokens in parallel.
+        Uses ThreadPoolExecutor with max_workers=5 for parallel prewarm,
+        with 3s staggered start to avoid per-IP rate limits.
+        Retries failed accounts in a loop until all are warm.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         import time as _t
         max_retries = 3
         for attempt in range(max_retries):
@@ -315,24 +318,21 @@ class GLMAccessTokenManager:
                          if a.is_guest and a.cached_token is None]
             if not remaining:
                 break
-            for idx in remaining:
-                try:
-                    acct = self._accounts[idx]
-                    if acct.cached_token is not None:
-                        continue
-                    acct.cached_token = self._fetch_guest_access_token(idx, rate_limit=True)
-                    if acct.cached_token:
-                        self.logger.info("后台预刷新 access_token 成功 index=%s", idx)
-                    else:
-                        self.logger.warning("后台预刷新 access_token 失败 index=%s", idx)
-                except Exception as exc:
-                    self.logger.warning("后台预刷新 access_token 失败 index=%s error=%s", idx, exc)
-                _t.sleep(3)
+            with ThreadPoolExecutor(max_workers=min(len(remaining), 5)) as pool:
+                futures = {pool.submit(self._fetch_guest_access_token, i, True): i for i in remaining}
+                for f in as_completed(futures):
+                    idx = futures[f]
+                    try:
+                        token = f.result()
+                        if token:
+                            self._accounts[idx].cached_token = token
+                            self.logger.info("后台预刷新 access_token 成功 index=%s", idx)
+                    except Exception as exc:
+                        self.logger.warning("后台预刷新 access_token 失败 index=%s error=%s", idx, exc)
             if attempt < max_retries - 1:
                 _t.sleep(10)  # Wait before retry cycle
         active = sum(1 for a in self._accounts if a.cached_token is not None)
         self.logger.info("后台预刷新完成 active=%s/%s", active, len(self._accounts))
-
     def spawn_fresh_guest_account(self) -> int:
         """Dynamically create a new guest account with fresh independent quota pool.
     
