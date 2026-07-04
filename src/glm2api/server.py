@@ -62,6 +62,7 @@ class GLM2APIServer:
                 self.end_headers()
 
             def do_GET(self) -> None:
+                self.timeout = 600
                 try:
                     self._debug_log_request_start()
                     path = self._path_without_query()
@@ -101,6 +102,7 @@ class GLM2APIServer:
                     )
 
             def do_POST(self) -> None:
+                self.timeout = 600
                 try:
                     self._debug_log_request_start()
                     path = self._path_without_query()

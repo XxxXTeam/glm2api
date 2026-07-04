@@ -84,6 +84,8 @@ class StreamingResponseWrapper:
         self._curl_resp = curl_response
         self._buffer = b""
         self._line_iter = curl_response.iter_lines()
+        self._read_deadline: float | None = None
+        import time as _time  # noqa: F811
         self.headers = curl_response.headers
         self.code = curl_response.status_code
         self.status_code = curl_response.status_code
@@ -123,7 +125,13 @@ class StreamingResponseWrapper:
         # Read exactly ONE line from iter_lines and return it (with \n restored)
         # _iter_sse_events will accumulate lines in its pending buffer
         try:
+            if _time.monotonic() > _deadline:
+                return b""
             line = next(self._line_iter)
+            if self._read_deadline is None:
+                self._read_deadline = _time.monotonic() + 300
+            elif _time.monotonic() > self._read_deadline:
+                return b""
             if isinstance(line, bytes):
                 self._buffer = line + b"\n"
             else:
