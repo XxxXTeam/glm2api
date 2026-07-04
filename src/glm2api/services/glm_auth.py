@@ -182,27 +182,43 @@ class GLMAccessTokenManager:
             self.logger.info("断路器关闭 — 上游已恢复")
 
     def _do_upstream_request(self, request: urllib.request.Request, use_unique_proxy: bool = False) -> tuple[int, dict]:
-        """Execute upstream request via curl_cffi with browser TLS fingerprinting.
-        Routes through proxy pool when available."""
+        """Execute upstream request, routing through proxy pool when available.
+        
+        Uses urllib for proxy connections (curl_cffi has TLS issues through SOCKS5).
+        Uses curl_cffi (do_json_request) for direct connections (Chrome 120 WAF bypass).
+        """
         from .glm2api_proxy import get_pool
-        from .http_client import do_json_request
         pool = get_pool()
         proxy_url = pool.get_unique() if use_unique_proxy else pool.get_next()
         if not proxy_url and pool._proxies:
             proxy_url = next(iter(pool._proxies))
+        
+        # Build request params
+        method = request.get_method() if hasattr(request, 'get_method') else 'POST'
+        url = str(request.full_url) if hasattr(request, 'full_url') else str(request)
+        headers = dict(request.header_items())
+        data = request.data if hasattr(request, "data") and request.data is not None else None
+        
         try:
-            status_code, payload = do_json_request(
-                method=request.get_method() if hasattr(request, 'get_method') else 'POST',
-                url=str(request.full_url) if hasattr(request, 'full_url') else str(request),
-                headers=dict(request.header_items()),
-                data=request.data if hasattr(request, "data") and request.data is not None else None,
-                proxy_url=proxy_url,
-                timeout=self.config.request_timeout,
-                logger=self.logger,
-            )
             if proxy_url:
+                # Use urllib for proxy connections (reliable through SOCKS5)
+                import urllib.request as _ur
+                proxy_handler = _ur.ProxyHandler({"https": proxy_url, "http": proxy_url})
+                opener = _ur.build_opener(proxy_handler)
+                req = _ur.Request(url, data=data, headers=headers, method=method)
+                resp = opener.open(req, timeout=self.config.request_timeout)
+                raw = resp.read()
+                payload = json.loads(raw.decode("utf-8"))
                 pool.report_success(proxy_url, 0)
-            return (status_code, payload)
+                return (resp.status, payload if isinstance(payload, dict) else {"data": payload})
+            else:
+                # Use curl_cffi for direct connections (Chrome 120 WAF bypass)
+                from .http_client import do_json_request
+                status_code, payload = do_json_request(
+                    method=method, url=url, headers=headers, data=data,
+                    proxy_url=None, timeout=self.config.request_timeout, logger=self.logger,
+                )
+                return (status_code, payload)
         except Exception as exc:
             if proxy_url:
                 pool.report_failure(proxy_url)

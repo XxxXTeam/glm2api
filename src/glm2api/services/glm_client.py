@@ -66,18 +66,28 @@ def _get_glm_opener():
 
     class _OpenerShim:
         def open(self, request, timeout=None):
+            # Route through proxy pool via urllib (reliable through SOCKS5).
+            # Token creation uses _do_upstream_request which also uses urllib.
             pool = get_pool()
             proxy_url = pool.get_next() if pool._proxies else None
-            print(f"[DEBUG] _OpenerShim using proxy: {proxy_url}", flush=True)
             headers = dict(getattr(request, 'header_items', lambda: [])())
             method = request.get_method() if hasattr(request, 'get_method') else "POST"
             url = request.full_url if hasattr(request, 'full_url') else str(request)
             data = request.data if hasattr(request, "data") and request.data is not None else None
             try:
-                result = do_request(method, url, headers, data, proxy_url, timeout or 300, stream=True)
                 if proxy_url:
+                    # Use urllib for proxy connections (curl_cffi has TLS issues through SOCKS5)
+                    import urllib.request as _ur
+                    proxy_handler = _ur.ProxyHandler({"https": proxy_url, "http": proxy_url})
+                    opener = _ur.build_opener(proxy_handler)
+                    req = _ur.Request(url, data=data, headers=headers, method=method)
+                    resp = opener.open(req, timeout=timeout or 300)
                     pool.report_success(proxy_url, 0)
-                return result
+                    return resp
+                else:
+                    # Direct: use curl_cffi for streaming support
+                    result = do_request(method, url, headers, data, None, timeout or 300, stream=True)
+                    return result
             except Exception as exc:
                 if proxy_url:
                     pool.report_failure(proxy_url)
