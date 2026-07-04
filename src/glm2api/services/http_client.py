@@ -22,13 +22,12 @@ IMPERSONATE_TARGET = "chrome120"  # Match GLM's Edge 143 / Chrome 143
 
 
 def get_client(proxy_url: str | None = None, logger: Logger | None = None) -> object:
-    """Get a curl_cffi Session for the given proxy.
-
-    Each call creates a fresh Session to avoid caching broken proxy state.
-    With 40 concurrent requests, creating 40 Sessions is negligible overhead
-    compared to 3-5s upstream latency.
-
-    Direct connections use key "__direct__" and ARE cached for reuse.
+    """Get or create a curl_cffi Session/request function for the given proxy.
+    
+    Direct connections: returns a cached Session (connection reuse).
+    Proxy connections: returns the curl_cffi module (use module-level request()).
+    Module-level requests create fresh internal Sessions each time, avoiding 
+    the TLS/handshake issues that cached Sessions have with SOCKS5 proxies.
     """
     try:
         from curl_cffi import requests as cffi_requests
@@ -38,7 +37,7 @@ def get_client(proxy_url: str | None = None, logger: Logger | None = None) -> ob
         return _get_httpx_fallback(proxy_url)
 
     if not proxy_url:
-        # Direct connections: cache the Session
+        # Direct connections: cache the Session for connection reuse
         key = "__direct__"
         if key in _clients:
             return _clients[key]
@@ -53,15 +52,10 @@ def get_client(proxy_url: str | None = None, logger: Logger | None = None) -> ob
             _clients[key] = client
             return client
 
-    # Proxy connections: create a fresh Session each time
-    # Caching Sessions with proxy state leads to stale connections
-    proxies = {"https": proxy_url, "http": proxy_url}
-    return cffi_requests.Session(
-        impersonate=IMPERSONATE_TARGET,
-        proxies=proxies,
-        timeout=120,
-        allow_redirects=True,
-    )
+    # Proxy connections: return module-level request function
+    # Module-level requests.post/create fresh internal Session per call,
+    # avoiding curl_cffi Session SOCKS5 proxy TLS issues
+    return cffi_requests
 
 
 def _get_httpx_fallback(proxy_url: str | None = None):

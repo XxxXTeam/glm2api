@@ -58,24 +58,29 @@ IMAGE_SIZE_TO_ASPECT_RATIO = {
 def _get_glm_opener():
     """Compatibility shim — delegates to http_client.do_request.
     
-    Existing code calls `_get_glm_opener().open(request, timeout=...)` which returns
-    a urllib addinfourl. We intercept that and route through curl_cffi.
+    Routes through the proxy pool when proxies are available.
+    Token creation uses _do_upstream_request which has its own proxy handling.
     """
     from .http_client import do_request
+    from .glm2api_proxy import get_pool
 
     class _OpenerShim:
         def open(self, request, timeout=None):
-            # Chat completions go DIRECT. Token creation uses _do_upstream_request (proxy)
-            # proxy_url = pool.get_next() if pool._proxies else None
+            pool = get_pool()
+            proxy_url = pool.get_next() if pool._proxies else None
+            print(f"[DEBUG] _OpenerShim using proxy: {proxy_url}", flush=True)
             headers = dict(getattr(request, 'header_items', lambda: [])())
             method = request.get_method() if hasattr(request, 'get_method') else "POST"
             url = request.full_url if hasattr(request, 'full_url') else str(request)
             data = request.data if hasattr(request, "data") and request.data is not None else None
             try:
-                # Route through proxy when available for all upstream requests
-                result = do_request(method, url, headers, data, None, timeout or 300, stream=True)
+                result = do_request(method, url, headers, data, proxy_url, timeout or 300, stream=True)
+                if proxy_url:
+                    pool.report_success(proxy_url, 0)
                 return result
             except Exception as exc:
+                if proxy_url:
+                    pool.report_failure(proxy_url)
                 raise urllib.error.URLError(str(exc)) from exc
 
         def close(self):
@@ -633,7 +638,7 @@ class GLMWebClient:
                             exc.code, attempt + 1, self.config.glm_busy_max_retries, account_index
                         )
                         # Immediately blacklist current proxy so next call picks a different one
-                        # Chat completions go DIRECT. Token creation uses _do_upstream_request (proxy)
+                        # Route through proxy pool when available. Token creation uses _do_upstream_request (proxy)
                         if pool._current:
                             pool.report_rate_limited(pool._current)
                         wait_seconds = self.config.glm_busy_retry_interval * (attempt + 1)

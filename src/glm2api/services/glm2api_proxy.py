@@ -382,7 +382,7 @@ class SmartProxyPool:
             if verified:
                 log.info("Auto-fetch complete: %d verified SOCKS5 proxies (pool total: %d)", len(verified), len(self._proxies))
         # Auto-discover multi-node VPN proxies on localhost
-        # self._discover_multi_vpn() — disabled: VPN proxy unstable
+        # self._discover_multi_vpn() — disabled: VPN proxy TLS issues
         self._current = next(iter(self._proxies)) if self._proxies else ""
 
     def _start_health_checks(self) -> None:
@@ -431,7 +431,7 @@ class SmartProxyPool:
             list(pool.map(_check_one, proxies))
 
         # -- Auto-discover any new multi-node VPN proxies --
-        # self._discover_multi_vpn() — disabled: VPN proxy unstable
+        # self._discover_multi_vpn() — disabled: VPN proxy TLS issues
 
         # -- Specific check for the aimiligate VPN proxy (http://127.0.0.1:7928) --
         # The generic TCP-level check above can report the VPN proxy as alive because
