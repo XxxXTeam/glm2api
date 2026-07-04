@@ -158,6 +158,12 @@ def anthropic_to_openai(payload: dict[str, object]) -> dict[str, object]:
         for tool in anthropic_tools:
             if not isinstance(tool, dict):
                 continue
+            # Anthropic web_search_* server tools → web_search: true flag
+            # This triggers resolve_networking() → is_networking=True → GLM networking mode
+            tool_type = str(tool.get("type", "")).strip()
+            if tool_type.startswith("web_search_"):
+                result["web_search"] = True
+                continue  # Don't add as function tool
             openai_tools.append({
                 "type": "function",
                 "function": {

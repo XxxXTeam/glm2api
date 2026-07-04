@@ -542,6 +542,12 @@ class GLMWebClient:
             model=requested_model,
             web_search=openai_payload.get("web_search"),
         )
+        # Also check for Anthropic-style web_search_* server tools in the payload
+        if not is_networking:
+            for tool in (openai_payload.get("tools") or []):
+                if isinstance(tool, dict) and str(tool.get("type", "")).startswith("web_search"):
+                    is_networking = True
+                    break
 
 
 
