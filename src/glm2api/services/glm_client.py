@@ -73,11 +73,8 @@ def _get_glm_opener():
             url = request.full_url if hasattr(request, 'full_url') else str(request)
             data = request.data if hasattr(request, 'data') and request.data else None
             try:
-                # HTTP proxies may not support streaming CONNECT tunnels properly.
-                # Use buffered mode when going through a proxy — _iter_sse_events
-                # splits on \n\n boundaries anyway, so buffering is fine.
-                use_stream = proxy_url is None  # streaming only for direct connections
-                result = do_request(method, url, headers, data, proxy_url, timeout or 300, stream=use_stream)
+                # Route through proxy when available for all upstream requests
+                result = do_request(method, url, headers, data, proxy_url, timeout or 300, stream=True)
                 if proxy_url:
                     pool.report_success(proxy_url, 0)
                 return result

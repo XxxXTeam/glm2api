@@ -262,8 +262,10 @@ class GLMAccessTokenManager:
                 # No pre-created tokens — create empty guest slots (lazy fetch)
                 self._accounts = [AccountState(refresh_token="", is_guest=True) for _ in range(pool_size)]
                 self.logger.info(
-                    "游客槽位初始化 数量=%s (延迟获取, 不预耗配额)", pool_size
+                    "游客槽位初始化 数量=%s (延迟获取) — 后台预刷新开始", pool_size
                 )
+                # Background pre-warm all guest slots
+                threading.Thread(target=self._background_prewarm, daemon=True).start()
         else:
             self._accounts = [
                 AccountState(refresh_token=t, is_guest=False) for t in raw_tokens
