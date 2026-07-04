@@ -575,7 +575,7 @@ class GLMWebClient:
                     "channel": "",
                     "chat_mode": chat_mode,
                     "draft_id": "",
-                    "if_plus_model": True,
+                    "if_plus_model": False,
                     "input_question_type": "xxxx",
                     "is_networking": is_networking,
                     "is_test": False,
