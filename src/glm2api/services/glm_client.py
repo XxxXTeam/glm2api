@@ -53,6 +53,7 @@ import re
 _SIZE_PATTERN = re.compile(r"\d+x\d+")
     "1024x1024": "1:1",
     "1024x1536": "2:3",
+_SIZE_PATTERN = re.compile(r"\d+x\d+")
     "1536x1024": "3:2",
     "1024x1792": "9:16",
     "1792x1024": "16:9",
