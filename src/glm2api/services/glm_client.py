@@ -59,8 +59,6 @@ _SIZE_PATTERN = re.compile(r"\d+x\d+")
     "1792x1024": "16:9",
 }
 
-_SIZE_PATTERN = re.compile(r"\d+x\d+")
-
 
 def _get_glm_opener():
     """Compatibility shim — delegates to http_client.do_request.
