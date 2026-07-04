@@ -18,7 +18,6 @@ from .services.anthropic_adapter import (
     openai_to_anthropic_response,
 )
 from .services.glm_client import GLMWebClient, QueueTimeoutError, UpstreamAPIError
-from .services.request_queue import get_request_queue
 from .services.responses_adapter import (
     ResponsesStreamAccumulator,
     openai_to_responses,

@@ -195,7 +195,7 @@ class GLMAccessTokenManager:
                 method=request.get_method() if hasattr(request, 'get_method') else 'POST',
                 url=str(request.full_url) if hasattr(request, 'full_url') else str(request),
                 headers=dict(request.header_items()),
-                data=request.data if hasattr(request, 'data') and request.data else None,
+                data=request.data if hasattr(request, "data") and request.data is not None else None,
                 proxy_url=proxy_url,
                 timeout=self.config.request_timeout,
                 logger=self.logger,

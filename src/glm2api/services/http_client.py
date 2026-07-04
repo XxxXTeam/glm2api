@@ -22,38 +22,46 @@ IMPERSONATE_TARGET = "chrome120"  # Match GLM's Edge 143 / Chrome 143
 
 
 def get_client(proxy_url: str | None = None, logger: Logger | None = None) -> object:
-    """Get or create a cached curl_cffi Session for the given proxy.
+    """Get a curl_cffi Session for the given proxy.
 
-    Each proxy gets its own persistent Session for connection reuse.
-    Direct connections use key "__direct__".
+    Each call creates a fresh Session to avoid caching broken proxy state.
+    With 40 concurrent requests, creating 40 Sessions is negligible overhead
+    compared to 3-5s upstream latency.
 
-    Returns a curl_cffi.requests.Session with Chrome 120 impersonation.
+    Direct connections use key "__direct__" and ARE cached for reuse.
     """
-    key = proxy_url or "__direct__"
-    if key in _clients:
-        return _clients[key]
-    with _clients_lock:
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        if logger:
+            logger.warning("curl_cffi not installed, falling back to httpx")
+        return _get_httpx_fallback(proxy_url)
+
+    if not proxy_url:
+        # Direct connections: cache the Session
+        key = "__direct__"
         if key in _clients:
             return _clients[key]
-        try:
-            from curl_cffi import requests as cffi_requests
-        except ImportError:
-            if logger:
-                logger.warning("curl_cffi not installed, falling back to httpx")
-            return _get_httpx_fallback(proxy_url)
+        with _clients_lock:
+            if key in _clients:
+                return _clients[key]
+            client = cffi_requests.Session(
+                impersonate=IMPERSONATE_TARGET,
+                timeout=120,
+                allow_redirects=True,
+            )
+            _clients[key] = client
+            return client
 
-        proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
-        client = cffi_requests.Session(
-            impersonate=IMPERSONATE_TARGET,
-            proxies=proxies,
-            timeout=120,
-            allow_redirects=True,
-        )
-        # No warmup GET here — Session state (cookies) would interfere with
-        # subsequent POST requests (guest token endpoint returns 405 otherwise).
-        # The warmup is done separately via _warm_connection in glm_auth.py.
-        _clients[key] = client
-        return client
+    # Proxy connections: create a fresh Session each time
+    # Caching Sessions with proxy state leads to stale connections
+    proxies = {"https": proxy_url, "http": proxy_url}
+    return cffi_requests.Session(
+        impersonate=IMPERSONATE_TARGET,
+        proxies=proxies,
+        timeout=120,
+        allow_redirects=True,
+    )
 
 
 def _get_httpx_fallback(proxy_url: str | None = None):
@@ -177,7 +185,7 @@ def do_request(
         method=method,
         url=url,
         headers=headers,
-        data=data if data else None,
+        data=data if data is not None else None,
         stream=stream,
         timeout=timeout,
     )
@@ -251,7 +259,7 @@ def do_request_oneshot(
             timeout=timeout,
             allow_redirects=True,
         )
-        resp = client.request(method=method, url=url, headers=headers, data=data if data else None)
+        resp = client.request(method=method, url=url, headers=headers, data=data if data is not None else None)
         client.close()
         content = resp.content
         content_encoding = ""

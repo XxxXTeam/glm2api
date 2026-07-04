@@ -71,7 +71,7 @@ def _get_glm_opener():
             headers = dict(getattr(request, 'header_items', lambda: [])())
             method = request.get_method() if hasattr(request, 'get_method') else "POST"
             url = request.full_url if hasattr(request, 'full_url') else str(request)
-            data = request.data if hasattr(request, 'data') and request.data else None
+            data = request.data if hasattr(request, "data") and request.data is not None else None
             try:
                 # Route through proxy when available for all upstream requests
                 result = do_request(method, url, headers, data, proxy_url, timeout or 300, stream=True)
