@@ -47,17 +47,14 @@ from .translator import (
 FILE_UPLOAD_URL_SUFFIX = "/backend-api/assistant/file_upload"
 FILE_SIZE_LIMIT = 100 * 1024 * 1024
 IMAGE_SIZE_TO_ASPECT_RATIO = {
-
-_SIZE_PATTERN = re.compile(r"\d+x\d+")
-import re
-_SIZE_PATTERN = re.compile(r"\d+x\d+")
     "1024x1024": "1:1",
     "1024x1536": "2:3",
-_SIZE_PATTERN = re.compile(r"\d+x\d+")
     "1536x1024": "3:2",
     "1024x1792": "9:16",
     "1792x1024": "16:9",
 }
+
+_SIZE_PATTERN = re.compile(r"\d+x\d+")
 
 
 def _get_glm_opener():
@@ -67,7 +64,7 @@ def _get_glm_opener():
     Token creation uses _do_upstream_request which has its own proxy handling.
     """
     from .http_client import do_request
-    from .glm2api_proxy import get_pool  # noqa: E402
+    from .glm2api_proxy import get_pool
 
     class _OpenerShim:
         def open(self, request, timeout=None):
