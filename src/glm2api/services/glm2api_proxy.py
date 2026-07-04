@@ -381,6 +381,8 @@ class SmartProxyPool:
                     self._proxies[u] = ProxyScore(url=u, verified_working=True)
             if verified:
                 log.info("Auto-fetch complete: %d verified SOCKS5 proxies (pool total: %d)", len(verified), len(self._proxies))
+        # Auto-discover multi-node VPN proxies on localhost
+        self._discover_multi_vpn()
         self._current = next(iter(self._proxies)) if self._proxies else ""
 
     def _start_health_checks(self) -> None:
@@ -428,6 +430,9 @@ class SmartProxyPool:
         with _cf.ThreadPoolExecutor(max_workers=50) as pool:
             list(pool.map(_check_one, proxies))
 
+        # -- Auto-discover any new multi-node VPN proxies --
+        self._discover_multi_vpn()
+
         # -- Specific check for the aimiligate VPN proxy (http://127.0.0.1:7928) --
         # The generic TCP-level check above can report the VPN proxy as alive because
         # the local proxy server process is still listening on the port, even when the
@@ -436,57 +441,111 @@ class SmartProxyPool:
         self._check_vpn_proxy(now)
 
     # ------------------------------------------------------------------ #
+    #  Multi-node VPN proxy auto-discovery
+    #  Scans localhost ports 7928-7935 for SOCKS5/HTTP proxies added by
+    #  connect_all_nodes.py (multi-tunnel VPN) or the main vpngate_manager.
+    # ------------------------------------------------------------------ #
+    _MULTI_VPN_PORTS = list(range(7928, 7936))
+
+    def _discover_multi_vpn(self) -> None:
+        """Auto-discover multi-node VPN proxies on localhost ports 7928-7935.
+
+        Each tunnel from connect_all_nodes.py starts a SOCKS5 proxy on a
+        unique port.  This method scans the port range, attempts a SOCKS5
+        handshake on each, and adds responsive proxies to the pool.
+        """
+        import socket as _sck
+        now = time.monotonic()
+        discovered = 0
+        for port in self._MULTI_VPN_PORTS:
+            url = f"socks5://127.0.0.1:{port}"
+            with self._lock:
+                if url in self._proxies:
+                    continue
+            try:
+                s = _sck.create_connection(("127.0.0.1", port), timeout=2)
+                # Quick SOCKS5 handshake to verify it's a real proxy
+                s.sendall(b"\x05\x01\x00")
+                resp = s.recv(2)
+                s.close()
+                if resp == b"\x05\x00":
+                    with self._lock:
+                        if url not in self._proxies:
+                            self._proxies[url] = ProxyScore(
+                                url=url, verified_working=True, alive=True,
+                            )
+                            discovered += 1
+                            log.info("Discovered multi-node VPN proxy: %s", url)
+            except Exception:
+                pass
+        if discovered:
+            log.info("Multi-VPN discovery: added %d new proxy(ies) on ports %s",
+                     discovered, self._MULTI_VPN_PORTS)
+
+    # ------------------------------------------------------------------ #
     #  Aimiligate VPN proxy special handling
     # ------------------------------------------------------------------ #
-    _VPN_PROXY_MARKER = "127.0.0.1:7928"
+    _VPN_PROXY_MARKERS = ["127.0.0.1:7928", "127.0.0.1:7929", "127.0.0.1:7930",
+                          "127.0.0.1:7931", "127.0.0.1:7932", "127.0.0.1:7933",
+                          "127.0.0.1:7934", "127.0.0.1:7935"]
 
     def _check_vpn_proxy(self, now: float) -> None:
-        """Application-level health check for the aimiligate VPN proxy.
+        """Application-level health check for the aimiligate VPN proxy(es).
 
-        If the proxy has been unreachable for >60s, trigger a VPN reconnect.
+        For each local VPN proxy (127.0.0.1:7928-7935), do an application-level
+        probe through the proxy to verify real connectivity.
+
+        If the primary proxy (7928) has been unreachable for >60s, trigger a
+        VPN reconnect.
         """
-        vpn_proxy: ProxyScore | None = None
+        vpn_proxies: list[tuple[str, ProxyScore]] = []
+        primary_vpn: ProxyScore | None = None
         with self._lock:
             for p in self._proxies.values():
-                if self._VPN_PROXY_MARKER in p.url:
-                    vpn_proxy = p
-                    break
+                for marker in self._VPN_PROXY_MARKERS:
+                    if marker in p.url:
+                        vpn_proxies.append((marker, p))
+                        if marker == "127.0.0.1:7928":
+                            primary_vpn = p
+                        break
 
-        if vpn_proxy is None:
-            return  # VPN proxy not in this pool, nothing to do
+        if not vpn_proxies:
+            return  # No VPN proxies in this pool, nothing to do
 
-        # Do an actual HTTP request through the proxy to verify real connectivity
-        vpn_alive = self._probe_vpn_proxy(vpn_proxy.url)
+        now_m = time.monotonic()
+        for marker, vpn_proxy in vpn_proxies:
+            # Do an actual HTTP request through the proxy to verify real connectivity
+            vpn_alive = self._probe_vpn_proxy(vpn_proxy.url)
 
-        if not vpn_alive:
-            # Mark it as failed in the pool
-            now_m = time.monotonic()
-            vpn_proxy.consec_failures += 1
-            vpn_proxy.last_fail = now_m
-            if vpn_proxy.consec_failures >= 2:
-                vpn_proxy.alive = False
-                vpn_proxy.blacklisted_until = now_m + min(
-                    self.COOLDOWN_BASE * (2 ** min(vpn_proxy.consec_failures, 5)),
-                    self.COOLDOWN_MAX,
-                )
-            vpn_proxy._score_cache = vpn_proxy._recompute_score()
-            log.warning(
-                "VPN proxy %s application-level check failed (%d consecutive)",
-                vpn_proxy.url, vpn_proxy.consec_failures,
-            )
-
-            # If it's been down for >60s, trigger a reconnect
-            if now_m - vpn_proxy.last_fail > 60:
-                log.warning("VPN proxy down for >60s, triggering VPN reconnect")
-                self._reconnect_vpn()
-        else:
-            # Restore to alive if it was down
-            if not vpn_proxy.alive:
-                log.info("VPN proxy %s is back online", vpn_proxy.url)
-                vpn_proxy.alive = True
-                vpn_proxy.consec_failures = 0
-                vpn_proxy.blacklisted_until = 0.0
+            if not vpn_alive:
+                # Mark it as failed in the pool
+                vpn_proxy.consec_failures += 1
+                vpn_proxy.last_fail = now_m
+                if vpn_proxy.consec_failures >= 2:
+                    vpn_proxy.alive = False
+                    vpn_proxy.blacklisted_until = now_m + min(
+                        self.COOLDOWN_BASE * (2 ** min(vpn_proxy.consec_failures, 5)),
+                        self.COOLDOWN_MAX,
+                    )
                 vpn_proxy._score_cache = vpn_proxy._recompute_score()
+                log.warning(
+                    "VPN proxy %s application-level check failed (%d consecutive)",
+                    vpn_proxy.url, vpn_proxy.consec_failures,
+                )
+            else:
+                # Restore to alive if it was down
+                if not vpn_proxy.alive:
+                    log.info("VPN proxy %s is back online", vpn_proxy.url)
+                    vpn_proxy.alive = True
+                    vpn_proxy.consec_failures = 0
+                    vpn_proxy.blacklisted_until = 0.0
+                    vpn_proxy._score_cache = vpn_proxy._recompute_score()
+
+        # If the primary VPN proxy (7928 — tun0, main vpngate_manager) has been
+        # down for >60s, trigger a full VPN reconnect
+        if primary_vpn is not None and now_m - primary_vpn.last_fail > 60:
+            log.warning("Primary VPN proxy down for >60s, triggering VPN reconnect")
+            self._reconnect_vpn()
 
     @staticmethod
     def _probe_vpn_proxy(proxy_url: str, target: str = "https://chatglm.cn/") -> bool:
