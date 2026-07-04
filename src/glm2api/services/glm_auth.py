@@ -275,24 +275,31 @@ class GLMAccessTokenManager:
             )
 
     def _background_prewarm(self) -> None:
-        """Background thread: pre-warms guest access tokens from pre-created refresh_tokens.
-        Uses staggered 3s intervals to avoid triggering the Tengine CDN per-IP rate limit."""
+        """Background thread: pre-warms guest access tokens.
+        Uses staggered 3s intervals to avoid triggering the Tengine CDN per-IP rate limit.
+        Retries failed accounts in a loop until all are warm."""
         import time as _t
-        for idx, acct in enumerate(self._accounts):
-            if not acct.is_guest:
-                continue
-            if acct.cached_token is not None:
-                continue  # already warm
-            try:
-                acct.cached_token = self._fetch_guest_access_token(idx, rate_limit=True)
-                if acct.cached_token:
-                    self.logger.info("后台预刷新 access_token 成功 index=%s", idx)
-                else:
-                    self.logger.warning("后台预刷新 access_token 失败 index=%s", idx)
-            except Exception as exc:
-                self.logger.warning("后台预刷新 access_token 失败 index=%s error=%s", idx, exc)
-            # Rate-limit friendly sleep between attempts
-            _t.sleep(3)
+        max_retries = 3
+        for attempt in range(max_retries):
+            remaining = [i for i, a in enumerate(self._accounts)
+                         if a.is_guest and a.cached_token is None]
+            if not remaining:
+                break
+            for idx in remaining:
+                try:
+                    acct = self._accounts[idx]
+                    if acct.cached_token is not None:
+                        continue
+                    acct.cached_token = self._fetch_guest_access_token(idx, rate_limit=True)
+                    if acct.cached_token:
+                        self.logger.info("后台预刷新 access_token 成功 index=%s", idx)
+                    else:
+                        self.logger.warning("后台预刷新 access_token 失败 index=%s", idx)
+                except Exception as exc:
+                    self.logger.warning("后台预刷新 access_token 失败 index=%s error=%s", idx, exc)
+                _t.sleep(3)
+            if attempt < max_retries - 1:
+                _t.sleep(10)  # Wait before retry cycle
         active = sum(1 for a in self._accounts if a.cached_token is not None)
         self.logger.info("后台预刷新完成 active=%s/%s", active, len(self._accounts))
 
@@ -975,3 +982,14 @@ class GLMAccessTokenManager:
     def clear_account_failures(self, account_index: int) -> None:
         with self._lock:
             self._account_fail_count.pop(account_index, None)
+
+    def record_empty_response(self, account_index: int) -> None:
+        """Mark account as exhausted (empty upstream response = quota used up).
+        Invalidates token so next request fetches a fresh one with new quota.
+        Also marks as rate-limited to prevent immediate reuse."""
+        import time as _t
+        with self._lock:
+            if 0 <= account_index < len(self._accounts):
+                self._accounts[account_index].cached_token = None
+                self._rate_limited_accounts[account_index] = _t.time()
+                self.logger.info("账号 quota 耗尽 index=%s — 已清空 token，下次请求将刷新", account_index)

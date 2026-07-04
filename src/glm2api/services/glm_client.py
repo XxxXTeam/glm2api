@@ -292,6 +292,7 @@ class GLMWebClient:
                     content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
                     if not content and not result.get("choices", [{}])[0].get("message", {}).get("tool_calls"):
                         self.logger.warning("上游返回空内容，使用新账号重试 account_index=%s", account_index)
+                        self.auth.record_empty_response(account_index)
                         self.auth.advance_account(account_index, "empty_content")
                         raise UpstreamAPIError(
                             status_code=502,
