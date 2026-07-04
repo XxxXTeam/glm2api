@@ -62,25 +62,20 @@ def _get_glm_opener():
     a urllib addinfourl. We intercept that and route through curl_cffi.
     """
     from .http_client import do_request
-    from .glm2api_proxy import get_pool
 
     class _OpenerShim:
         def open(self, request, timeout=None):
-            pool = get_pool()
-            proxy_url = pool.get_next() if pool._proxies else None
+            # Chat completions go DIRECT. Token creation uses _do_upstream_request (proxy)
+            # proxy_url = pool.get_next() if pool._proxies else None
             headers = dict(getattr(request, 'header_items', lambda: [])())
             method = request.get_method() if hasattr(request, 'get_method') else "POST"
             url = request.full_url if hasattr(request, 'full_url') else str(request)
             data = request.data if hasattr(request, "data") and request.data is not None else None
             try:
                 # Route through proxy when available for all upstream requests
-                result = do_request(method, url, headers, data, proxy_url, timeout or 300, stream=True)
-                if proxy_url:
-                    pool.report_success(proxy_url, 0)
+                result = do_request(method, url, headers, data, None, timeout or 300, stream=True)
                 return result
             except Exception as exc:
-                if proxy_url:
-                    pool.report_failure(proxy_url)
                 raise urllib.error.URLError(str(exc)) from exc
 
         def close(self):
@@ -638,8 +633,7 @@ class GLMWebClient:
                             exc.code, attempt + 1, self.config.glm_busy_max_retries, account_index
                         )
                         # Immediately blacklist current proxy so next call picks a different one
-                        from .glm2api_proxy import get_pool
-                        pool = get_pool()
+                        # Chat completions go DIRECT. Token creation uses _do_upstream_request (proxy)
                         if pool._current:
                             pool.report_rate_limited(pool._current)
                         wait_seconds = self.config.glm_busy_retry_interval * (attempt + 1)
@@ -1186,7 +1180,6 @@ class GLMWebClient:
                     err_str = str(exc).lower()
                     # ponytail: on SSL errors, rotate proxy immediately
                     if "ssl" in err_str or "certificate" in err_str or "eof" in err_str:
-                        from .glm2api_proxy import get_pool as _get_pool
                         _pool = _get_pool()
                         if _pool._current:
                             _pool.report_rate_limited(_pool._current)
