@@ -36,7 +36,7 @@ def build_sign() -> tuple[str, str, str]:
     return timestamp, nonce, sign
 
 
-def build_random_x_forwarded_for() -> str:
+def _random_ip() -> str:
     while True:
         first_octet = random.randint(1, 223)
         if first_octet in {10, 127, 169, 172, 192}:
@@ -45,6 +45,20 @@ def build_random_x_forwarded_for() -> str:
         for _ in range(3):
             octets.append(random.randint(0, 255))
         return ".".join(str(octet) for octet in octets)
+
+
+# Pre-generated random IPs for X-Forwarded-For (avoids per-request random.randint)
+_IP_POOL: list[str] = [_random_ip() for _ in range(200)]
+_IP_POOL_INDEX = 0
+_IP_POOL_LOCK = threading.Lock()
+
+def _random_ip() -> str:
+    """Get a random IP from the pre-generated pool, rotating through it."""
+    global _IP_POOL_INDEX
+    with _IP_POOL_LOCK:
+        idx = _IP_POOL_INDEX
+        _IP_POOL_INDEX = (idx + 1) % len(_IP_POOL)
+    return _IP_POOL[idx]
 
 
 @dataclass(slots=True)
@@ -443,7 +457,7 @@ class GLMAccessTokenManager:
                 "X-Lang": "en" if self.config.glm_use_guest_refresh_token else "zh",
             }
         headers = dict(self._STATIC_HEADERS_CACHE[cache_key])
-        headers["X-Forwarded-For"] = build_random_x_forwarded_for()
+        headers["X-Forwarded-For"] = _random_ip()  # pre-generated batch
         return headers
 
     def read_json_response(self, response) -> dict[str, object]:
