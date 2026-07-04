@@ -688,8 +688,6 @@ class SmartProxyPool:
             
             if candidates:
                 # Round-robin through all candidates for guest token creation
-                if not hasattr(self, '_guest_rr_index'):
-                    self._guest_rr_index = 0
                 chosen = candidates[self._guest_rr_index % len(candidates)]
                 self._guest_rr_index = (self._guest_rr_index + 1) % len(candidates)
                 self._current = chosen.url
@@ -738,8 +736,6 @@ class SmartProxyPool:
             candidates.sort(key=lambda p: p.total_calls)
 
             # Round-robin through sorted candidates
-            if not hasattr(self, '_main_rr_index'):
-                self._main_rr_index = 0
             self._main_rr_index %= len(candidates)
             chosen = candidates[self._main_rr_index]
             self._main_rr_index = (self._main_rr_index + 1) % len(candidates)

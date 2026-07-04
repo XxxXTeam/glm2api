@@ -564,6 +564,9 @@ def resolve_networking(model: str, web_search: object) -> bool:
 
 @dataclass
 class GLMEventAccumulator:
+    # Pre-serialized SSE frame prefix for speed
+    _SSE_PREFIX = b'data: '
+    _SSE_SUFFIX = b'\n\n'
 
     model: str
     allowed_tool_names: set[str] | None = None
