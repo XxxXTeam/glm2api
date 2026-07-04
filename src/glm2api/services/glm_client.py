@@ -47,6 +47,8 @@ from .translator import (
 FILE_UPLOAD_URL_SUFFIX = "/backend-api/assistant/file_upload"
 FILE_SIZE_LIMIT = 100 * 1024 * 1024
 IMAGE_SIZE_TO_ASPECT_RATIO = {
+
+_SIZE_PATTERN = re.compile(r"\d+x\d+")
 import re
 _SIZE_PATTERN = re.compile(r"\d+x\d+")
     "1024x1024": "1:1",
