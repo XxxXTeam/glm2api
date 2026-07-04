@@ -330,8 +330,8 @@ class SmartProxyPool:
             with self._lock:
                 total = len(self._proxies)
                 alive = sum(1 for p in self._proxies.values() if p.alive)
-                # Only refresh if >50% dead AND pool has meaningful size
-                if total > 50 and alive / total > 0.5:
+                # Refresh when <30% alive — triggers regardless of pool size
+                if alive / max(total, 1) > 0.3:
                     return
                 log.warning("Proxy pool degraded: %d/%d alive. Auto-refreshing...", alive, total)
 
@@ -355,6 +355,9 @@ class SmartProxyPool:
         lst = os.environ.get("GLM_PROXY_LIST", "").strip()
         if lst:
             urls.extend(u.strip() for u in lst.split(",") if u.strip())
+        extra = os.environ.get("GLM_PROXY_LIST_EXTRA", "").strip()
+        if extra:
+            urls.extend(u.strip() for u in extra.split(",") if u.strip())
         for i in range(10):
             val = os.environ.get(f"GLM_PROXY_{i}", "").strip()
             if val:
@@ -581,7 +584,7 @@ class SmartProxyPool:
                 return chosen.url
 
             # All blacklisted — trigger background auto-refresh
-            if len(self._proxies) > 50 and now - self._last_refresh > 300:
+            if len(self._proxies) > 10 and now - self._last_refresh > 300:
                 threading.Thread(target=self._auto_refresh, daemon=True).start()
 
             # retry the soonest proxy immediately if it's been down for a while
@@ -668,7 +671,7 @@ class SmartProxyPool:
                             p.last_fail = now
                             pass
                 # All blacklisted — trigger background auto-refresh
-                if len(self._proxies) > 50 and now - self._last_refresh > 300:
+                if len(self._proxies) > 10 and now - self._last_refresh > 300:
                     threading.Thread(target=self._auto_refresh, daemon=True).start()
                 return None
 

@@ -82,6 +82,13 @@ class GLM2APIServer:
                         )
                         return
 
+                    if path == "/proxy/status":
+                        from .services.glm2api_proxy import get_pool
+                        pool = get_pool()
+                        status = pool.get_status()
+                        self._write_json(200, status)
+                        return
+
                     logger.debug("GET 未匹配 path=%s", self.path)
                     self._write_json(HTTPStatus.NOT_FOUND, {"error": {"message": "Not Found"}})
                 except _CLIENT_DISCONNECTED:
