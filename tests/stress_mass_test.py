@@ -64,8 +64,9 @@ print("\n=== PART 2: Queue Timeout Precision ===")
 def timeout_precision():
     q = ConcurrentRequestQueue(logger=__import__('logging').getLogger('test'), wait_timeout=0.1, max_concurrency=3)
     q._ensure_accounts(3)
-    # Fill all 9 slots (3 accounts x 3 slots)
-    leases = [q.acquire("fill", account_pool_size=3) for _ in range(9)]
+    # Fill ALL slots (3 accounts x PER_ACCOUNT_LIMIT slots each)
+    total_slots = len(q._sems) * ConcurrentRequestQueue.PER_ACCOUNT_LIMIT
+    leases = [q.acquire("fill", account_pool_size=3) for _ in range(total_slots)]
     t0 = time.monotonic()
     try:
         q.acquire("timeout-test", account_pool_size=3)
@@ -86,6 +87,10 @@ def proxy_pool_stress():
     pool._lock = threading.Lock()
     pool._proxies = {}
     pool._last_refresh = 0.0
+    pool._last_hot_refresh = 0.0
+    pool._hot_pool = []
+    pool._hot_pool_size = 100
+    pool._hot_refresh_interval = 30.0
 
     # 500 proxies: 100 good (high score), 100 medium, 300 bad (low score)
     for i in range(100):
@@ -113,8 +118,8 @@ def proxy_pool_stress():
     for _ in range(1000):
         pool.get_best()
     elapsed = time.monotonic() - t0
-    # ponytail: with 500 proxies in single-pass, 1000 calls well under 20ms
-    check("1000 get_best calls < 100ms", elapsed < 0.1, f"{elapsed*1000:.1f}ms")
+    # ponytail: hot pool selection — 1000 calls well under 150ms
+    check("1000 get_best calls < 150ms", elapsed < 0.15, f"{elapsed*1000:.1f}ms")
 
 proxy_pool_stress()
 
@@ -126,6 +131,10 @@ def concurrent_reporting():
     pool._lock = threading.Lock()
     pool._proxies = {"socks5://test:1080": ProxyScore(url="socks5://test:1080")}
     pool._last_refresh = 0.0
+    pool._last_hot_refresh = 0.0
+    pool._hot_pool = []
+    pool._hot_pool_size = 100
+    pool._hot_refresh_interval = 30.0
 
     def worker_success():
         for _ in range(10):

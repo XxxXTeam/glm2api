@@ -6,7 +6,7 @@ chat/completions format so the existing GLM pipeline can be reused.
 
 from __future__ import annotations
 
-import json
+import orjson
 import time
 import uuid
 
@@ -91,9 +91,9 @@ def anthropic_to_openai(payload: dict[str, object]) -> dict[str, object]:
                     "type": "function",
                     "function": {
                         "name": str(block.get("name", "")),
-                        "arguments": json.dumps(
-                            block.get("input", {}), ensure_ascii=False, separators=(",", ":")
-                        ),
+                        "arguments": orjson.dumps(
+                            block.get("input", {})
+                        ).decode("utf-8"),
                     },
                 })
 
@@ -238,8 +238,8 @@ def openai_to_anthropic_response(result: dict[str, object], model: str) -> dict[
                             continue
                         fn = tc.get("function", {})
                         try:
-                            input_data = json.loads(fn.get("arguments", "{}"))  # type: ignore[union-attr]
-                        except (json.JSONDecodeError, TypeError):
+                            input_data = orjson.loads(fn.get("arguments", "{}"))  # type: ignore[union-attr]
+                        except (orjson.JSONDecodeError, TypeError):
                             input_data = {}
                         content.append({
                             "type": "tool_use",
@@ -324,8 +324,8 @@ class AnthropicStreamAccumulator:
                 continue
             if line.startswith("data: "):
                 try:
-                    data = json.loads(line[6:])
-                except json.JSONDecodeError:
+                    data = orjson.loads(line[6:])
+                except orjson.JSONDecodeError:
                     continue
                 events.extend(self._process_openai_chunk(data))
         return events

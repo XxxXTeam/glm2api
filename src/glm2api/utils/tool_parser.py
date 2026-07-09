@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import orjson
 import re
 import uuid
 import xml.etree.ElementTree as ET
@@ -63,6 +63,11 @@ INVOKE_COMPLETE_PATTERN = re.compile(
     r"<\|DSML\|invoke\s+[^>]+>.*?</\|DSML\|invoke\s*>",
     re.DOTALL,
 )
+
+# Fast-path guard: cheap scan for any DSML-relevant characters before full parsing
+_DSML_FAST = re.compile(r"<|\b(tool_call|invoke|parameter)\b", re.IGNORECASE).search
+# Precompiled regex for collapsing excessive newlines
+_CLEAN_NEWLINES_RE = re.compile(r"\n{3,}")
 
 
 def _local_name(tag: str) -> str:
@@ -141,12 +146,12 @@ def _coerce_leaf_value(text: str) -> object:
         return ""
     if stripped.startswith("{") or stripped.startswith("["):
         try:
-            return json.loads(stripped)
-        except json.JSONDecodeError:
+            return orjson.loads(stripped)
+        except orjson.JSONDecodeError:
             if stripped.startswith("[") and not stripped.endswith("]"):
                 try:
-                    return json.loads(stripped + "]")
-                except json.JSONDecodeError:
+                    return orjson.loads(stripped + "]")
+                except orjson.JSONDecodeError:
                     pass
             return stripped
     if stripped in {"true", "false"}:
@@ -234,7 +239,7 @@ def _build_tool_call(name: str, arguments: dict[str, object], index: int) -> dic
         "index": index,
         "function": {
             "name": name,
-            "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+            "arguments": orjson.dumps(arguments).decode("utf-8"),
         },
     }
 
@@ -347,6 +352,8 @@ def _parse_xml_block(
 
 
 def _mask_code_fences(text: str) -> str:
+    if "<" not in text and "|" not in text:  # fast-path: no DSML markers
+        return text
     masked = list(text)
     for match in CODE_FENCE_PATTERN.finditer(text):
         for index in range(match.start(), match.end()):
@@ -378,6 +385,8 @@ def _extract_tool_blocks(
     allow_trailing_close: bool = False,
 ) -> tuple[list[tuple[int, int]], list[dict[str, object]]]:
     masked_text = _mask_code_fences(text)
+    if "<" not in masked_text:  # fast-path: no tags at all
+        return [], []
     spans: list[tuple[int, int]] = []
     tool_calls: list[dict[str, object]] = []
     cursor = 0
@@ -442,14 +451,16 @@ def parse_tool_calls_from_text(text: str, allowed_tool_names: set[str] | None = 
 # Early invoke extraction — emit tool calls during streaming (not just at finalize)
 # ---------------------------------------------------------------------------
 
-def _has_unclosed_outer_block(text: str) -> bool:
-    """Check if text contains an unclosed <|DSML|tool_calls> opening tag."""
+def _has_unclosed_outer_block(text: str) -> int | None:
+    """Return the index of the start of an unclosed outer DSML block, or None."""
+    if not text or ("<" not in text and "|" not in text):
+        return None
     masked = _mask_code_fences(text)
     start_match = START_TAG_PATTERN.search(masked)
     if start_match is None:
-        return False
+        return None
     span = _find_matching_block(masked, start_match, allow_trailing_close=False)
-    return span is None  # Opening tag found but no matching close
+    return start_match.start() if span is None else None
 
 
 def _extract_early_invoke_tool_calls(
@@ -498,6 +509,8 @@ def _is_partial_dsml_tag(text: str) -> int | None:
       2. Partial tag name without `>` — e.g. `<|DSML|tool_calls` (no > yet)
       3. Complete opening tag without matching close — e.g. `<ml_tool_calls>` alone
     """
+    if not text or ("<" not in text and "|" not in text):
+        return None
     lowered = text.lower()
 
     # Priority 1: Complete opening tag without matching close.
@@ -527,7 +540,7 @@ def _clean_visible(text: str) -> str:
     """Strip model chatter and tool_result blocks from visible text."""
     cleaned = TOOL_CHATTER_PATTERN.sub("", text)
     cleaned = TOOL_RESULT_PATTERN.sub("", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = _CLEAN_NEWLINES_RE.sub("\n\n", cleaned)
     return cleaned
 
 
@@ -558,6 +571,12 @@ class StreamingToolParser:
         if not chunk:
             return ""
         self.pending_text += chunk
+
+        # Fast-path: if no DSML markers, skip all expensive parsing
+        if _DSML_FAST(self.pending_text) is None:
+            visible = self.pending_text
+            self.pending_text = ""
+            return _clean_visible(visible)
 
         # 1. Look for complete DSML blocks (outer <|DSML|tool_calls> closed)
         spans, new_calls = _extract_tool_blocks(

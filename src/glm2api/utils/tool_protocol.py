@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import orjson
 import re
 
 
@@ -30,7 +30,7 @@ CANONICAL_TOOL_CALL_EXAMPLE = "\n".join(
 
 
 def safe_json_dumps(payload: object) -> str:
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return orjson.dumps(payload).decode("utf-8")
 
 
 def normalize_tool_name(name: object) -> str:
@@ -88,8 +88,8 @@ def serialize_tool_call_block(name: str, arguments: object) -> str:
     parsed_arguments = arguments
     if isinstance(arguments, str):
         try:
-            parsed_arguments = json.loads(arguments)
-        except json.JSONDecodeError:
+            parsed_arguments = orjson.loads(arguments)
+        except orjson.JSONDecodeError:
             parsed_arguments = {"raw": arguments}
     if not isinstance(parsed_arguments, dict):
         parsed_arguments = {"value": parsed_arguments}
@@ -207,6 +207,35 @@ def build_tool_call_instructions(
             ]
         )
     return "\n".join(lines)
+
+
+def detect_client(user_agent: str = "") -> str:
+    """Detect which client/IDE is making the request. ponytail: simple UA matching."""
+    ua = user_agent.lower()
+    if "cherrystudio" in ua or "cherry-studio" in ua:
+        return "cherry-studio"
+    if "opencode" in ua or "roo-code" in ua or "witsy" in ua:
+        return "opencode"
+    if "cline" in ua:
+        return "cline"
+    return "default"
+
+
+def serialize_tool_call_bracket(name: str, arguments: str) -> str:
+    """[function_calls tool_name(param1="val1", param2="val2")]"""
+    try:
+        args_dict = orjson.loads(arguments) if isinstance(arguments, str) else arguments
+        params = ", ".join(f'{k}="{v}"' for k, v in args_dict.items())
+        return f'[function_calls {name}({params})]'
+    except (orjson.JSONDecodeError, TypeError):
+        return f'[function_calls {name}({arguments})]'
+
+
+def serialize_tool_call(name: str, arguments: str, client: str = "default") -> str:
+    """Appropriate format for client. ponytail: bracket for known clients, XML for rest."""
+    if client in ("cherry-studio", "opencode", "cline"):
+        return serialize_tool_call_bracket(name, arguments)
+    return serialize_tool_call_block(name=name, arguments=arguments)
 
 
 def tools_to_prompt(

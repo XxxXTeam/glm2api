@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import platform
 import signal
 import traceback
 
@@ -15,9 +16,10 @@ class StartupError(RuntimeError):
 
 
 class Application:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, async_server: bool = False) -> None:
         setup_logging(config.log_level)
         self.config = config
+        self.async_server = async_server
         self.logger = get_logger("glm2api.app")
         self.logger.info(
             "初始化应用 并发=%s 账号数=%s 暴露模型=%s",
@@ -35,11 +37,19 @@ class Application:
                     self.logger.warning(f"预热游客 token 失败: {exc}")
             threading.Thread(target=_bg_prewarm, daemon=True, name="prewarm").start()
         try:
-            self.server = GLM2APIServer(
-                config=config,
-                glm_client=self.client,
-                logger=get_logger("glm2api.http"),
-            )
+            if async_server:
+                from .server_async import AsyncGLM2APIServer
+                self.server = AsyncGLM2APIServer(
+                    config=config,
+                    glm_client=self.client,
+                    logger=get_logger("glm2api.http"),
+                )
+            else:
+                self.server = GLM2APIServer(
+                    config=config,
+                    glm_client=self.client,
+                    logger=get_logger("glm2api.http"),
+                )
         except OSError as exc:
             raise self._wrap_server_error(exc) from exc
         except Exception as exc:
@@ -48,6 +58,20 @@ class Application:
         self._install_signal_handlers()
 
     def run(self) -> None:
+        if self.async_server:
+            import asyncio
+            # uvloop is 2-4x faster but not available on Windows
+            if platform.system() != "Windows":
+                try:
+                    import uvloop
+                    uvloop.install()
+                except ImportError:
+                    pass
+            asyncio.run(self._run_async())
+        else:
+            self._run_sync()
+
+    def _run_sync(self) -> None:
         if self.config.env_file_created:
             self.logger.info("未检测到配置文件，已自动从默认示例复制: %s", self.config.env_file_path)
         self.logger.info(
@@ -61,6 +85,31 @@ class Application:
         )
         try:
             self.server.serve_forever()
+        except KeyboardInterrupt:
+            self.logger.info("收到 Ctrl+C，正在优雅关闭服务...")
+        except OSError as exc:
+            self.logger.error("HTTP 服务运行时异常 error=%s", exc)
+            raise StartupError(f"HTTP 服务运行失败: {exc}") from exc
+        except Exception as exc:
+            self.logger.error("服务异常退出 error=%s\n%s", exc, traceback.format_exc())
+            raise
+        finally:
+            self.stop()
+
+    async def _run_async(self) -> None:
+        if self.config.env_file_created:
+            self.logger.info("未检测到配置文件，已自动从默认示例复制: %s", self.config.env_file_path)
+        self.logger.info(
+            "启动服务 host=%s port=%s prefix=%s accounts=%s debug_dump_all=%s models=%s",
+            self.config.host,
+            self.config.port,
+            self.config.api_prefix,
+            len(self.config.glm_refresh_tokens),
+            self.config.debug_dump_all,
+            ",".join(self.config.exposed_models),
+        )
+        try:
+            await self.server.serve_forever()
         except KeyboardInterrupt:
             self.logger.info("收到 Ctrl+C，正在优雅关闭服务...")
         except OSError as exc:
@@ -93,7 +142,8 @@ class Application:
         for signum in (signal.SIGINT, signal.SIGTERM):
             try:
                 signal.signal(signum, self._handle_signal)
-            except (ValueError, AttributeError):
+            except (ValueError, AttributeError, OSError):
+                # Windows doesn't support SIGTERM; OSError for permission issues
                 continue
 
     def _handle_signal(self, signum: int, frame) -> None:
@@ -119,3 +169,13 @@ def create_application() -> Application:
     except Exception as exc:
         raise StartupError(f"读取配置失败: {exc}") from exc
     return Application(config)
+
+
+def create_async_application() -> Application:
+    try:
+        config = load_config()
+    except ConfigError:
+        raise
+    except Exception as exc:
+        raise StartupError(f"读取配置失败: {exc}") from exc
+    return Application(config, async_server=True)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
+import signal
 import socket
 import threading
 import traceback
@@ -40,11 +42,30 @@ class GLM2APIServer:
         self._server.allow_reuse_address = True
 
     def serve_forever(self) -> None:
+        # Register signal handlers for graceful shutdown
+        def _signal_handler(signum, frame):
+            self.logger.warning("收到信号 %s，正在优雅关闭...", signum)
+            self.shutdown()
+
+        try:
+            signal.signal(signal.SIGTERM, _signal_handler)
+        except (ValueError, OSError):
+            pass  # Windows doesn't support SIGTERM
+        try:
+            signal.signal(signal.SIGINT, _signal_handler)
+        except (ValueError, OSError):
+            pass
         self._server.serve_forever()
 
     def shutdown(self) -> None:
         self._server.shutdown()
         self._server.server_close()
+        # Close all cached HTTP sessions to release connections
+        try:
+            from .services.http_client import close_all
+            close_all()
+        except Exception as exc:
+            self.logger.warning("close_all failed: %s", exc)
 
     def _build_handler(self):
         config = self.config
@@ -55,18 +76,70 @@ class GLM2APIServer:
             server_version = "glm2api/0.1.0"
             protocol_version = "HTTP/1.1"
 
+            def _set_tcp_nodelay(self) -> None:
+                """Disable Nagle's algorithm for lower-latency streaming."""
+                try:
+                    self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except (OSError, AttributeError):
+                    pass
+
             def do_OPTIONS(self) -> None:
                 self.send_response(HTTPStatus.NO_CONTENT)
                 self._send_common_headers()
                 self.end_headers()
 
             def do_GET(self) -> None:
+                self._set_tcp_nodelay()
                 self.timeout = 600
                 try:
                     self._debug_log_request_start()
                     path = self._path_without_query()
                     if path == "/health":
-                        self._write_json(HTTPStatus.OK, {"status": "ok"})
+                        import time as _t_h
+                        from .services.glm2api_proxy import get_pool as _get_pool_h
+
+                        # Proxy pool health
+                        _pool_h = _get_pool_h()
+                        proxy_summary = _pool_h.get_summary()
+
+                        # Auth / token pool health
+                        auth_status = glm_client.auth.get_subsystem_status()
+
+                        # Queue depth
+                        qd = glm_client.request_queue.queue_depth
+
+                        # Overall health: degrade if starved, circuit open, or pool critically low
+                        degraded = (
+                            auth_status.get("token_pool", {}).get("starved", False)
+                            or auth_status.get("circuit_breaker", {}).get("open", False)
+                            or proxy_summary.get("alive", 0) < 3
+                        )
+
+                        health_data: dict[str, object] = {
+                            "status": "degraded" if degraded else "ok",
+                            "timestamp": _t_h.time(),
+                            "uptime_seconds": _t_h.monotonic(),
+                            "subsystems": {
+                                "proxy_pool": proxy_summary,
+                                "token_pool": auth_status.get("token_pool", {}),
+                                "circuit_breaker": auth_status.get("circuit_breaker", {}),
+                                "queue": {
+                                    "depth": qd,
+                                    "per_account_limit": glm_client.request_queue.PER_ACCOUNT_LIMIT,
+                                },
+                            },
+                            "account_strategy": auth_status.get("account_strategy", "ewma"),
+                            "consecutive_failures": auth_status.get("consecutive_failures", 0),
+                        }
+
+                        # Return 503 when truly dead, not just degraded
+                        http_status = (
+                            HTTPStatus.SERVICE_UNAVAILABLE
+                            if auth_status.get("token_pool", {}).get("starved", False)
+                            else HTTPStatus.OK
+                        )
+
+                        self._write_json(http_status, health_data)
                         return
 
                     if path == f"{config.api_prefix}/models":
@@ -101,6 +174,7 @@ class GLM2APIServer:
                     )
 
             def do_POST(self) -> None:
+                self._set_tcp_nodelay()
                 self.timeout = 600
                 try:
                     self._debug_log_request_start()
@@ -110,6 +184,7 @@ class GLM2APIServer:
                         f"{config.api_prefix}/images/generations",
                         f"{config.api_prefix}/messages",
                         f"{config.api_prefix}/responses",
+                        "/anthropic/v1/messages",
                     }:
                         logger.debug("POST 未匹配 path=%s", self.path)
                         self._write_json(HTTPStatus.NOT_FOUND, {"error": {"message": "Not Found"}})
@@ -118,6 +193,39 @@ class GLM2APIServer:
                     if not self._authorize():
                         logger.warning("认证失败 path=%s ip=%s", self.path, self.client_address[0])
                         self._write_json(HTTPStatus.UNAUTHORIZED, {"error": {"message": "Unauthorized"}})
+                        return
+
+                    # --- Backpressure: reject early when overloaded ---
+                    _qd = glm_client.request_queue.queue_depth
+                    _BACKPRESSURE_LIMIT = 100
+                    if _qd >= _BACKPRESSURE_LIMIT:
+                        logger.warning(
+                            "背压触发 — 队列深度 %d >= %d, 拒绝请求 path=%s",
+                            _qd, _BACKPRESSURE_LIMIT, self.path,
+                        )
+                        self._write_json(
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            {
+                                "error": {
+                                    "message": f"服务过载 (队列深度 {_qd})，请稍后重试。",
+                                    "type": "backpressure",
+                                    "queue_depth": _qd,
+                                }
+                            },
+                        )
+                        return
+                    # Also reject if token pool is completely starved
+                    if glm_client.auth.is_starved():
+                        logger.warning("账号池枯竭，拒绝请求 path=%s", self.path)
+                        self._write_json(
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            {
+                                "error": {
+                                    "message": "所有账号临时不可用，请稍后重试。",
+                                    "type": "token_pool_starved",
+                                }
+                            },
+                        )
                         return
 
                     content_length = self._parse_content_length()
@@ -157,9 +265,12 @@ class GLM2APIServer:
                         return
                     debug_dump(logger, config.debug_dump_all, f"HTTP 入站解析后 JSON path={self.path}", payload)
 
+                    # ponytail: inject User-Agent for client detection in tool call format
+                    payload["_user_agent"] = self.headers.get("User-Agent", "")
+
                     # --- Anthropic Messages API ---
-                    if path == f"{config.api_prefix}/messages":
-                        logger.info("收到 Anthropic 请求 model=%s stream=%s", payload.get("model"), payload.get("stream"))
+                    if path in {f"{config.api_prefix}/messages", "/anthropic/v1/messages"}:
+                        logger.info("收到 Anthropic 请求 model=%s stream=%s path=%s", payload.get("model"), payload.get("stream"), path)
                         self._handle_anthropic_messages(payload)
                         return
 
@@ -263,16 +374,23 @@ class GLM2APIServer:
                     return
                 except Exception as exc:
                     logger.error("Anthropic 流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
+                    try:
+                        error_event = f"data: {json.dumps({'type': 'error', 'error': {'message': str(exc), 'type': 'upstream_error'}}, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                        self.wfile.write(error_event.encode("utf-8"))
+                        self.wfile.flush()
+                    except _CLIENT_DISCONNECTED:
+                        pass
 
                 # Ensure message_stop is always sent (idempotent via _finished flag)
                 if accumulator.started:
                     try:
                         for event in accumulator._finish():
                             self.wfile.write(event.encode("utf-8"))
-                            self.wfile.flush()
+                        self.wfile.flush()
                     except _CLIENT_DISCONNECTED:
                         pass
 
+                self._close_after_stream()
                 logger.info("Anthropic 流式请求完成 model=%s", model)
 
             # ---- OpenAI Responses API ----
@@ -340,16 +458,23 @@ class GLM2APIServer:
                     return
                 except Exception as exc:
                     logger.error("Responses 流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
+                    try:
+                        error_event = f"data: {json.dumps({'type': 'error', 'error': {'message': str(exc), 'type': 'upstream_error'}}, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                        self.wfile.write(error_event.encode("utf-8"))
+                        self.wfile.flush()
+                    except _CLIENT_DISCONNECTED:
+                        pass
 
                 # Ensure response.completed is always sent (idempotent via _finished flag)
                 if accumulator.started:
                     try:
                         for event in accumulator._finish():
                             self.wfile.write(event.encode("utf-8"))
-                            self.wfile.flush()
+                        self.wfile.flush()
                     except _CLIENT_DISCONNECTED:
                         pass
 
+                self._close_after_stream()
                 logger.info("Responses 流式请求完成 model=%s", model)
 
             # ---- Chat completions (original) ----
@@ -361,6 +486,7 @@ class GLM2APIServer:
 
                 stream_iter = glm_client.stream_chat_completion(payload)
                 sent_done = False
+                completed_normally = False
                 try:
                     for chunk in stream_iter:
                         if chunk:
@@ -369,6 +495,7 @@ class GLM2APIServer:
                             self.wfile.flush()
                             if b"data: [DONE]\n\n" in chunk:
                                 sent_done = True
+                    completed_normally = True
                 except UpstreamAPIError as exc:
                     logger.warning("流式请求中途收到上游错误 status=%s error=%s", exc.status_code, exc)
                     self._write_sse_error(str(exc), "upstream_error")
@@ -379,12 +506,13 @@ class GLM2APIServer:
                     logger.error("流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
                     self._write_sse_error(str(exc), exc.__class__.__name__)
                 finally:
-                    if not sent_done:
+                    if not sent_done and completed_normally:
                         try:
                             self.wfile.write(b"data: [DONE]\n\n")
                             self.wfile.flush()
                         except _CLIENT_DISCONNECTED:
                             pass
+                self._close_after_stream()
                 logger.info("流式请求完成 model=%s", model)
 
             # ---- Auth ----
@@ -435,6 +563,19 @@ class GLM2APIServer:
                     self.wfile.flush()
                 except _CLIENT_DISCONNECTED:
                     return
+
+            def _close_after_stream(self) -> None:
+                """Close the HTTP connection after SSE stream ends."""
+                self.close_connection = True
+
+            def handle_one_request(self) -> None:
+                """Override to close connection properly after SSE streaming."""
+                super().handle_one_request()
+                if self.close_connection and hasattr(self, 'wfile') and not self.wfile.closed:
+                    try:
+                        self.wfile.close()
+                    except Exception:
+                        pass
 
             def _safe_write_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
                 try:

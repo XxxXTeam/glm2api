@@ -152,7 +152,12 @@ class AppConfig:
     glm_busy_max_retries: int
     glm_busy_retry_interval: float
     glm_guest_max_retries: int
+    glm_proxy_max_retries: int  # ponytail: ceiling — retries per failed proxy before falling through
+    glm_account_strategy: str  # ponytail: "ewma" (default) or "fill_first"
     blocked_tool_names: list[str]
+    # ponytail: context management
+    context_strategy: str
+    context_limit: int
     exposed_models: list[str]
     model_aliases: dict[str, str]
     server_api_keys: list[str]
@@ -278,7 +283,12 @@ def load_config(env_file: str = ".env") -> AppConfig:
 	        glm_busy_max_retries=parse_int(values.get("GLM_BUSY_MAX_RETRIES"), 5),
         glm_busy_retry_interval=parse_float(values.get("GLM_BUSY_RETRY_INTERVAL_SECONDS"), 2.0),
         glm_guest_max_retries=max(0, parse_int(values.get("GLM_GUEST_MAX_RETRIES"), 3)),
+        glm_proxy_max_retries=max(0, parse_int(values.get("GLM_PROXY_MAX_RETRIES"), 2)),
+        glm_account_strategy=values.get("GLM_ACCOUNT_STRATEGY", "ewma").strip().lower(),
         blocked_tool_names=parse_list(values.get("BLOCKED_TOOL_NAMES"), DEFAULT_BLOCKED_TOOL_NAMES),
+        # ponytail: context management from env
+        context_strategy=values.get("CONTEXT_STRATEGY", "sliding").strip().lower(),
+        context_limit=parse_int(values.get("CONTEXT_LIMIT"), 30),
         exposed_models=exposed_models,  # type: ignore
         model_aliases=model_aliases,
         server_api_keys=parse_list(values.get("SERVER_API_KEYS")),

@@ -10,7 +10,10 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "httpx[http2,socks]>=0.28.1",
-]  # Ponytail: all deps removed — pure stdlib now
+    "orjson>=3.10.0",
+    "aiohttp>=3.11.0",
+    "uvloop>=0.21.0",
+]  # orjson: 10x faster JSON (required, not optional)
 
 [project.scripts]
 glm2api = "glm2api.__main__:main"

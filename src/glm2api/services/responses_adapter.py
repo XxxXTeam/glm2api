@@ -6,7 +6,7 @@ chat/completions format so the existing GLM pipeline can be reused.
 
 from __future__ import annotations
 
-import json
+import orjson
 import time
 import uuid
 
@@ -115,7 +115,7 @@ def responses_to_openai(payload: dict[str, object]) -> dict[str, object]:
 
             elif item_type == "function_call":
                 try:
-                    args = json.dumps(item.get("arguments", {}), ensure_ascii=False, separators=(",", ":")) \
+                    args = orjson.dumps(item.get("arguments", {})).decode("utf-8") \
                         if not isinstance(item.get("arguments"), str) else str(item.get("arguments", "{}"))
                 except (TypeError, ValueError):
                     args = "{}"
@@ -370,8 +370,8 @@ class ResponsesStreamAccumulator:
                 continue
             if line.startswith("data: "):
                 try:
-                    data = json.loads(line[6:])
-                except json.JSONDecodeError:
+                    data = orjson.loads(line[6:])
+                except orjson.JSONDecodeError:
                     continue
                 events.extend(self._process_openai_chunk(data))
         return events

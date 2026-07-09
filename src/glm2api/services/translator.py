@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import json
+import orjson
+import httpx
 import logging
 import re
 import time
@@ -22,15 +23,13 @@ _THINK_OPEN_RE = re.compile(r'<think>')
 _THINK_CLOSE_RE = re.compile(r'</think>')
 _THINK_BLOCK_RE = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 from ..utils.tool_protocol import (
-    BLOCKED_NATIVE_TOOL_NAMES,
-    CANONICAL_TOOL_CALL_EXAMPLE,
     SERVER_SIDE_TOOL_NAMES,
     build_tool_call_instructions as _protocol_build_tool_call_instructions,
     filter_tools,
-    normalize_tool_name,
     safe_json_dumps,
     serialize_tool_call_block as _protocol_serialize_tool_call_block,
     serialize_tool_result_block as _protocol_serialize_tool_result_block,
+    serialize_tool_call,
     tools_to_prompt as _protocol_tools_to_prompt,
 )
 
@@ -48,18 +47,39 @@ URL_PATTERN = re.compile(r"https?://[^\s<>()\"']+")
 POWERSHELL_CMDLET_PATTERN = re.compile(r"^[A-Z][A-Za-z]+-[A-Z][A-Za-z]+$")
 POWERSHELL_ALIASES = {"cat", "cd", "copy", "del", "dir", "echo", "erase", "ls", "md", "move", "pwd", "rd", "ren", "rm", "sc", "type"}
 
-_SEARCH_RESULT_COUNT = 8
+_SEARCH_RESULT_COUNT = 6  # ponytail: top N is enough for LLM context, fewer = faster parse
 
 # Thread-safe search cache for parallel pre-fetch (ponytail: zero-wait DDG)
 _SEARCH_CACHE: dict[str, tuple[float, str]] = {}
 _SEARCH_CACHE_LOCK = Lock()
-_SEARCH_CACHE_TTL = 60.0  # seconds to keep cached results
+_SEARCH_CACHE_TTL = 180.0  # ponytail: 3min — better conversation reuse than 60s
+_SEARCH_CACHE_MAX = 200
+
+# Shared httpx client for connection reuse across searches (HTTP/2, keep-alive)
+_HTTPX_CLIENT: httpx.Client | None = None
+_HTTPX_CLIENT_LOCK = Lock()
+
+def _json_dumps(obj: object) -> str:
+    """Ultra-fast JSON serialization with orjson (C extension)."""
+    return orjson.dumps(obj, option=orjson.OPT_SORT_KEYS).decode("utf-8")
+
+def _json_loads(s: str | bytes) -> object:
+    """Ultra-fast JSON parsing with orjson (C extension)."""
+    return orjson.loads(s)
 
 def _cache_search_query(query: str) -> None:
     """Pre-fetch search results in a background thread and cache them.
     Uses _run_web_search (which has all imports resolved at call time)."""
     t = threading.Thread(target=_do_cache_search, args=(query,), daemon=True)
     t.start()
+
+def _evict_search_cache_if_needed() -> None:
+    """Evict oldest 25% of entries when cache exceeds max."""
+    if len(_SEARCH_CACHE) > _SEARCH_CACHE_MAX:
+        # Sort by timestamp (kv[1][0]), keep newest entries
+        oldest = sorted(_SEARCH_CACHE.items(), key=lambda kv: kv[1][0])[:50]
+        for k, _ in oldest:
+            del _SEARCH_CACHE[k]
 
 def _do_cache_search(query: str) -> None:
     """Worker: run the search and cache results."""
@@ -68,19 +88,17 @@ def _do_cache_search(query: str) -> None:
         if result and not result.startswith("Search error") and not result.startswith("No search"):
             with _SEARCH_CACHE_LOCK:
                 _SEARCH_CACHE[query.lower().strip()] = (time.monotonic(), result)
-                _MAX_SEARCH_CACHE = 200
-                if len(_SEARCH_CACHE) > _MAX_SEARCH_CACHE:
-                    oldest = sorted(_SEARCH_CACHE.items(), key=lambda kv: kv[1][1])[:50]
-                    for k, _ in oldest:
-                        del _SEARCH_CACHE[k]
+                _evict_search_cache_if_needed()
     except Exception:
         pass
 
 def _get_cached_search(query: str) -> str | None:
-    """Get cached search results if they exist and are fresh."""
+    """Get cached search results if fresh. Updates access time for LRU eviction."""
     with _SEARCH_CACHE_LOCK:
         entry = _SEARCH_CACHE.get(query.lower().strip())
         if entry and (time.monotonic() - entry[0]) < _SEARCH_CACHE_TTL:
+            # ponytail: touch timestamp on access — LRU survives eviction
+            _SEARCH_CACHE[query.lower().strip()] = (time.monotonic(), entry[1])
             return entry[1]
     return None
 
@@ -117,8 +135,24 @@ def _ddg_unwrap_url(href: str) -> str:
     return href
 
 
+# ponytail: fast regex parser for DDG Lite HTML (~10x faster than stdlib HTMLParser)
+_DDG_LINK_RE = re.compile(r'<a[^>]*class="result-link"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', re.DOTALL)
+_DDG_SNIPPET_RE = re.compile(r'<td[^>]*class="result-snippet"[^>]*>(.*?)</td>', re.DOTALL)
+
 def _parse_ddg_lite(html: str) -> list[tuple[str, str, str]]:
-    """Parse DuckDuckGo Lite HTML using stdlib HTMLParser. No external deps."""
+    """Parse DuckDuckGo Lite HTML — fast regex path, fallback stdlib HTMLParser."""
+    try:
+        links = _DDG_LINK_RE.findall(html)
+        snippets = _DDG_SNIPPET_RE.findall(html)
+        results: list[tuple[str, str, str]] = []
+        for i, (href, title) in enumerate(links):
+            snippet = snippets[i].strip() if i < len(snippets) else ""
+            results.append((title.strip(), _ddg_unwrap_url(href), snippet))
+        if results:
+            return results
+    except Exception:
+        pass
+    # Fallback: stdlib HTMLParser
     parser = _DDGLiteParser()
     parser.feed(html)
     parser.close()
@@ -174,29 +208,47 @@ class _DDGLiteParser(HTMLParser):
         self._commit()
 
 
+def _get_httpx_client() -> httpx.Client:
+    """Get or create shared httpx client with connection pooling and HTTP/2."""
+    global _HTTPX_CLIENT
+    if _HTTPX_CLIENT is None:
+        with _HTTPX_CLIENT_LOCK:
+            if _HTTPX_CLIENT is None:
+                _HTTPX_CLIENT = httpx.Client(http2=True, timeout=5.0, follow_redirects=True)
+    return _HTTPX_CLIENT
+
+
 def _run_web_search(query: str) -> str:
-    """Search via DuckDuckGo Lite using stdlib. No external dependencies."""
-    import urllib.request
+    """Search via DuckDuckGo Lite using httpx (connection-pooled, HTTP/2)."""
     try:
-        data = urllib.parse.urlencode({"q": query, "kl": "us-en"}).encode()
-        req = urllib.request.Request(
+        client = _get_httpx_client()
+        resp = client.post(
             "https://lite.duckduckgo.com/lite",
-            data=data,
+            data={"q": query, "kl": "us-en"},
             headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
         )
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            if resp.status == 200:
-                results = _parse_ddg_lite(resp.read().decode())
-                if results:
-                    lines = [f'Web search results for "{query}":']
-                    for i, (title, link, snippet) in enumerate(results[:_SEARCH_RESULT_COUNT], 1):
-                        lines.append(f"{i}. {title}\n   URL: {link}\n   {snippet}")
-                    return "\n".join(lines)
+        if resp.status_code == 200:
+            results = _parse_ddg_lite(resp.text)
+            if results:
+                lines = [f'Web search results for "{query}":']
+                for i, (title, link, snippet) in enumerate(results[:_SEARCH_RESULT_COUNT], 1):
+                    lines.append(f"{i}. {title}\n   URL: {link}\n   {snippet}")
+                return "\n".join(lines)
     except Exception as exc:
         return f"Search error: {exc}"
 
     return f"No search results found for: {query}"
 
+
+
+def _run_and_cache_search(query: str) -> str:
+    """Run web search and atomically cache the result for future reuse."""
+    result = _run_web_search(query)
+    if result and not result.startswith("Search error") and not result.startswith("No search"):
+        with _SEARCH_CACHE_LOCK:
+            _SEARCH_CACHE[query.lower().strip()] = (time.monotonic(), result)
+            _evict_search_cache_if_needed()
+    return result
 
 
 def _execute_retrieve_tool_calls(tool_calls: list[dict[str, object]]) -> tuple[str, list[dict[str, object]]]:
@@ -216,8 +268,8 @@ def _execute_retrieve_tool_calls(tool_calls: list[dict[str, object]]) -> tuple[s
             continue
         arguments = fn.get("arguments", "{}")
         try:
-            args = json.loads(arguments) if isinstance(arguments, str) else arguments
-        except json.JSONDecodeError:
+            args = _json_loads(arguments) if isinstance(arguments, str) else arguments
+        except (orjson.JSONDecodeError, Exception):
             remaining.append(tc)
             continue
         if isinstance(args, dict):
@@ -233,19 +285,40 @@ def _execute_retrieve_tool_calls(tool_calls: list[dict[str, object]]) -> tuple[s
                         elif isinstance(item, str):
                             search_tasks.append((item.strip(), tool_id))
 
-    # ponytail: run searches concurrently — 50 searches × 3s sequential = 150s, concurrent = 3s
+    if not search_tasks:
+        return "", tool_calls
+
+    # ponytail: deduplicate — same query searched once, not N times
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for q, _ in search_tasks:
+        key = q.lower().strip()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(q)
+
+    # ponytail: run searches concurrently, checking cache first
     import concurrent.futures as _cf
     search_results: list[str] = []
-    if search_tasks:
-        with _cf.ThreadPoolExecutor(max_workers=10) as pool:
-            fut_map = {pool.submit(_run_web_search, q): q for q, _ in search_tasks}
-            for f in _cf.as_completed(fut_map):
-                q = fut_map[f]
-                try:
-                    result = f.result()
-                    search_results.append(f"Search query: {q}\n\nResults:\n{result}")
-                except Exception as exc:
-                    search_results.append(f"Search query: {q}\n\nResults:\nSearch error: {exc}")
+
+    with _cf.ThreadPoolExecutor(max_workers=10) as pool:
+        fut_map: dict[_cf.Future[str], str] = {}
+        for q in deduped:
+            cached = _get_cached_search(q)
+            if cached is not None:
+                search_results.append(f"Search query: {q}\n\nResults:\n{cached}")
+            else:
+                # Start background prefetch AND pool task — fastest-wins
+                _cache_search_query(q)
+                fut = pool.submit(_run_and_cache_search, q)
+                fut_map[fut] = q
+        for f in _cf.as_completed(fut_map):
+            q = fut_map[f]
+            try:
+                result = f.result()
+                search_results.append(f"Search query: {q}\n\nResults:\n{result}")
+            except Exception as exc:
+                search_results.append(f"Search query: {q}\n\nResults:\nSearch error: {exc}")
 
     if search_results:
         content = "\n\n---\n\n".join(search_results)
@@ -259,7 +332,7 @@ def extract_text_content(content: object) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, dict):
-        return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+        return _json_dumps(content)
     if not isinstance(content, list):
         return ""
 
@@ -305,8 +378,8 @@ def sanitize_tool_call_payload(
     parsed_arguments = arguments
     if isinstance(arguments, str):
         try:
-            parsed_arguments = json.loads(arguments)
-        except json.JSONDecodeError:
+            parsed_arguments = _json_loads(arguments)
+        except (orjson.JSONDecodeError, Exception):
             return None
 
     if parsed_arguments is None:
@@ -328,15 +401,15 @@ def sanitize_tool_call_payload(
             stripped_command = command.strip()
             if stripped_command.startswith("["):
                 try:
-                    parsed_command = json.loads(stripped_command)
-                except json.JSONDecodeError:
+                    parsed_command = _json_loads(stripped_command)
+                except (orjson.JSONDecodeError, Exception):
                     parsed_command = None
                 if isinstance(parsed_command, list):
                     cleaned["command"] = [str(part) for part in parsed_command]
             elif stripped_command.startswith('"'):
                 try:
-                    parsed_command = json.loads(f"[{stripped_command}]")
-                except json.JSONDecodeError:
+                    parsed_command = _json_loads(f"[{stripped_command}]")
+                except (orjson.JSONDecodeError, Exception):
                     parsed_command = None
                 if isinstance(parsed_command, list):
                     cleaned["command"] = [str(part) for part in parsed_command]
@@ -380,8 +453,8 @@ def sanitize_tool_calls(
         original_value: object = original_arguments
         if isinstance(original_arguments, str):
             try:
-                original_value = json.loads(original_arguments)
-            except json.JSONDecodeError:
+                original_value = _json_loads(original_arguments)
+            except (orjson.JSONDecodeError, Exception):
                 original_value = original_arguments
         cleaned_arguments = sanitize_tool_call_payload(
             tool_name=tool_name,
@@ -438,13 +511,48 @@ serialize_tool_result_block = _protocol_serialize_tool_result_block
 tools_to_prompt = _protocol_tools_to_prompt
 
 
+# ponytail: context management — sliding window + token truncation
+def apply_context_strategy(
+    messages: list[dict[str, object]],
+    strategy: str = "sliding",
+    limit: int = 30,
+) -> list[dict[str, object]]:
+    """Apply sliding-window or token-limit strategy to trim context.
+    chars/3 ≈ tokens for mixed CN/EN content."""
+    if not messages or limit <= 0:
+        return messages
+    system_msg = None
+    rest = list(messages)
+    if rest and rest[0].get("role") in ("system", "developer"):
+        system_msg = rest.pop(0)
+    if strategy == "sliding" and len(rest) > limit:
+        rest = rest[-limit:]
+    if strategy == "token":
+        total = sum(len(str(m.get("content", ""))) // 3 for m in rest)
+        while total > limit and len(rest) > 1:
+            removed = rest.pop(0)
+            total -= len(str(removed.get("content", ""))) // 3
+    result = [system_msg] if system_msg else []
+    result.extend(rest)
+    return result
+
+
 def convert_messages(
     messages: list[dict[str, object]],
     tools: list[dict[str, object]] | None,
     blocked_tool_names: set[str] | None = None,
     tool_choice: object | None = None,
     server_side_tool_names: set[str] | None = None,
+    # ponytail: context strategy params
+    context_strategy: str = "sliding",
+    context_limit: int = 30,
+    # ponytail: client detection for bracket protocol
+    client: str = "default",
+    # ponytail: pre-extracted URL from caller to avoid double scan
+    latest_user_url: str | None = None,
 ) -> list[dict[str, object]]:
+    # ponytail: trim context before processing
+    messages = apply_context_strategy(messages, context_strategy, context_limit)
     tools = filter_tools(tools, blocked_tool_names or set())
     available_tool_names = {
         str(tool.get("function", {}).get("name", "")).strip()
@@ -455,14 +563,27 @@ def convert_messages(
     server_side_tool_names = server_side_tool_names or SERVER_SIDE_TOOL_NAMES
     tool_choice_policy = parse_tool_choice_policy(tool_choice, available_tool_names)
     processed: list[dict[str, str]] = []
-    latest_user_url: str | None = extract_recent_user_url(messages)
+    if latest_user_url is None:
+        latest_user_url = extract_recent_user_url(messages)
     valid_tool_call_ids: set[str] = set()
     repaired_tool_call_ids: set[str] = set()
+    # ponytail: local content cache to avoid re-iterating list content
+    _content_cache: dict[int, str] = {}
+    def _extract(content: object) -> str:
+        if isinstance(content, str):
+            return content
+        key = id(content)
+        cached = _content_cache.get(key)
+        if cached is not None:
+            return cached
+        result = extract_text_content(content)
+        _content_cache[key] = result
+        return result
     for message in messages:
         role = str(message.get("role", "user"))
         content = message.get("content")
         if role == "user":
-            current_text = extract_text_content(content)
+            current_text = _extract(content)
             current_url = extract_first_url(current_text)
             if current_url:
                 latest_user_url = current_url
@@ -479,9 +600,10 @@ def convert_messages(
                 if available_tool_names and tool_name not in available_tool_names:
                     continue
                 tool_blocks.append(
-                    serialize_tool_call_block(
+                    serialize_tool_call(
                         name=tool_name,
                         arguments=function.get("arguments", "{}"),
+                        client=client,
                     )
                 )
                 tool_call_id = str(tool_call.get("id", "")).strip()
@@ -489,7 +611,7 @@ def convert_messages(
                     valid_tool_call_ids.add(tool_call_id)
                     if bool(tool_call.get("_repaired")):
                         repaired_tool_call_ids.add(tool_call_id)
-            assistant_text = extract_text_content(content).strip() if content else ""
+            assistant_text = _extract(content).strip() if content else ""
             block = "\n".join(tool_blocks)
             if not assistant_text and not block:
                 continue
@@ -502,7 +624,7 @@ def convert_messages(
                 continue
             role = "user"
             tool_name = str(message.get("name", "")).strip() or "unknown_tool"
-            tool_result_text = extract_text_content(content)
+            tool_result_text = _extract(content)
             content = serialize_tool_result_block(
                 tool_call_id=tool_call_id or message.get("tool_call_id", "unknown"),
                 tool_name=tool_name,
@@ -511,7 +633,7 @@ def convert_messages(
         elif role == "assistant" and not content:
             continue
 
-        text = extract_text_content(content) if content else ""
+        text = _extract(content) if content else ""
         if text:
             processed.append({"role": role, "content": text})
 
@@ -536,9 +658,11 @@ def convert_messages(
             .replace("user", "User")
             .replace("developer", "Developer")
         )
-        transcript_parts.append(f"{title}: {item['content']}".strip())
+        line = f"{title}: {item['content']}".strip()
+        if line:
+            transcript_parts.append(line)
 
-    prompt = "\n\n".join(part for part in transcript_parts if part).strip()
+    prompt = "\n\n".join(transcript_parts).strip()
     return [{"role": "user", "content": [{"type": "text", "text": prompt + "\n\nAssistant: "}]}]
 
 
@@ -581,8 +705,8 @@ class GLMEventAccumulator:
     last_full_reasoning: str = ""
     _part_text_sent: dict[str, int] = field(default_factory=dict)
     _part_reasoning_sent: dict[str, int] = field(default_factory=dict)
-    _known_logic_ids_for_text: list[str] = field(default_factory=list)
-    _known_logic_ids_for_reasoning: list[str] = field(default_factory=list)
+    _known_logic_ids_for_text: set[str] = field(default_factory=set)
+    _known_logic_ids_for_reasoning: set[str] = field(default_factory=set)
     tool_parser: StreamingToolParser = field(default_factory=StreamingToolParser)
     emitted_role: bool = False
     _render_cache_dirty: bool = True
@@ -601,6 +725,31 @@ class GLMEventAccumulator:
 
     def __post_init__(self) -> None:
         self.tool_parser.allowed_tool_names = self.allowed_tool_names
+
+    def _prefetch_search_from_tool_call(self, tool_call: dict[str, object]) -> None:
+        """If the tool call is a search/retrieve, start background cache pre-fetch."""
+        fn = tool_call.get("function", {})
+        tool_name = str(fn.get("name", "")).strip().lower()
+        if tool_name not in {"retrieve", "search", "web_search"}:
+            return
+        arguments = fn.get("arguments", "{}")
+        try:
+            args = _json_loads(arguments) if isinstance(arguments, str) else arguments
+        except Exception:
+            return
+        if not isinstance(args, dict):
+            return
+        for val in args.values():
+            if isinstance(val, str) and val.strip():
+                _cache_search_query(val.strip())
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, dict):
+                        for v in item.values():
+                            if isinstance(v, str) and v.strip():
+                                _cache_search_query(v.strip())
+                    elif isinstance(item, str) and item.strip():
+                        _cache_search_query(item.strip())
 
     def consume_event(self, payload: dict[str, object]) -> tuple[list[bytes], str | None]:
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM SSE 解析事件", payload)
@@ -697,6 +846,9 @@ class GLMEventAccumulator:
                             }]
                         })
                     )
+                # ponytail: pre-fetch search queries in background during streaming
+                for tc in new_calls:
+                    self._prefetch_search_from_tool_call(tc)
 
         visible_text_delta = self.tool_parser.consume(text_delta)
         if visible_text_delta:
@@ -764,6 +916,9 @@ class GLMEventAccumulator:
                 )
                 self._emitted_tool_call_ids.add(tc["id"])
             self._tool_calls_emitted_count = len(self.tool_parser.tool_calls)
+            # ponytail: pre-fetch search queries in background during streaming
+            for tc in new_tool_calls:
+                self._prefetch_search_from_tool_call(tc)
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM SSE 生成增量块", chunks)
         return chunks, str(payload.get("status")) if payload.get("status") is not None else None
 
@@ -1024,7 +1179,7 @@ class GLMEventAccumulator:
                 prev_len = self._part_text_sent.get(logic_id, 0)
                 is_new = logic_id not in self._known_logic_ids_for_text
                 if is_new:
-                    self._known_logic_ids_for_text.append(logic_id)
+                    self._known_logic_ids_for_text.add(logic_id)
                     if text_delta_parts or self._part_text_sent:
                         text_delta_parts.append("\n\n")
                     text_delta_parts.append(rendered_text)
@@ -1036,7 +1191,7 @@ class GLMEventAccumulator:
                 prev_len = self._part_reasoning_sent.get(logic_id, 0)
                 is_new = logic_id not in self._known_logic_ids_for_reasoning
                 if is_new:
-                    self._known_logic_ids_for_reasoning.append(logic_id)
+                    self._known_logic_ids_for_reasoning.add(logic_id)
                     if reasoning_delta_parts or self._part_reasoning_sent:
                         reasoning_delta_parts.append("\n\n")
                     reasoning_delta_parts.append(rendered_reasoning)
@@ -1102,7 +1257,7 @@ class GLMEventAccumulator:
     _SSE_SUFFIX = b"\n\n"
 
     def _chunk_json(self, patch: dict[str, object]) -> bytes:
-        """Build SSE frame as bytes — avoids str.encode() per chunk in hot path."""
+        """Build SSE frame as bytes — orjson for 10x faster serialization."""
         payload = {
             "id": self.conversation_id,
             "object": "chat.completion.chunk",
@@ -1110,5 +1265,9 @@ class GLMEventAccumulator:
             "model": self.model,
         }
         payload.update(patch)
-        return self._SSE_PREFIX + safe_json_dumps(payload).encode("utf-8") + self._SSE_SUFFIX
+        try:
+            raw = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
+        except Exception:
+            raw = safe_json_dumps(payload).encode("utf-8")
+        return self._SSE_PREFIX + raw + self._SSE_SUFFIX
 

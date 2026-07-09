@@ -1,5 +1,5 @@
+from glm2api.utils.tool_protocol import BLOCKED_NATIVE_TOOL_NAMES
 from glm2api.services.translator import (
-    BLOCKED_NATIVE_TOOL_NAMES,
     GLMEventAccumulator,
     convert_messages,
     sanitize_tool_call_payload,

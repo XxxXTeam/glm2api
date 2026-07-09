@@ -1,15 +1,26 @@
 from __future__ import annotations
 
+import platform
+import sys
 import traceback
 
-from .app import StartupError, create_application
+from .app import StartupError, create_application, create_async_application
 from .config import ConfigError
 from .logging_utils import get_logger, setup_logging
 
 
 def main() -> int:
+    # Windows event loop compatibility
+    if platform.system() == "Windows":
+        import asyncio
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    use_async = "--async" in sys.argv
     try:
-        application = create_application()
+        if use_async:
+            application = create_async_application()
+        else:
+            application = create_application()
     except (ConfigError, StartupError) as exc:
         # Logging may not be set up yet — fall back to plain print for early errors
         print(f"[glm2api] 启动失败: {exc}")

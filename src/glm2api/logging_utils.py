@@ -212,9 +212,9 @@ def serialize_for_debug(value: Any) -> str:
     if isinstance(value, str):
         return value
     try:
-        import json
+        import orjson
 
-        return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+        return orjson.dumps(value, option=orjson.OPT_SORT_KEYS | orjson.OPT_INDENT_2).decode("utf-8")
     except Exception:
         return repr(value)
 
