@@ -16,6 +16,7 @@ GUEST_REFRESH_TOKEN_MARKER = "__glm_guest__"
 DEFAULT_BLOCKED_TOOL_NAMES = ()
 BUILTIN_EXPOSED_MODELS = (
     "cogView-4-250304",
+    "glm-5.3",
     "glm-5.2",
     "glm-5.1",
     "glm-5v-turbo",

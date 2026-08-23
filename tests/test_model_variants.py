@@ -57,3 +57,8 @@ def test_existing_thinking_model_name_still_enables_chat_mode():
 def test_glm_5_2_is_exposed_and_passed_through():
     assert "glm-5.2" in BUILTIN_EXPOSED_MODELS
     assert BUILTIN_MODEL_ALIASES["glm-5.2"] == "glm-5.2"
+
+
+def test_glm_5_3_is_exposed_and_passed_through():
+    assert "glm-5.3" in BUILTIN_EXPOSED_MODELS
+    assert BUILTIN_MODEL_ALIASES["glm-5.3"] == "glm-5.3"
