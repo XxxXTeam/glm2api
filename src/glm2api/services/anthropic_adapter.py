@@ -161,6 +161,11 @@ def anthropic_to_openai(payload: dict[str, object]) -> dict[str, object]:
         for tool in anthropic_tools:
             if not isinstance(tool, dict):
                 continue
+            tool_type = str(tool.get("type", "")).strip()
+            # Anthropic server tools: web_search_20250305, web_search_20260209, web_search_20260318
+            if tool_type.startswith("web_search_"):
+                result["web_search"] = True
+                continue
             openai_tools.append({
                 "type": "function",
                 "function": {
